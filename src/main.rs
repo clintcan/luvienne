@@ -11,7 +11,57 @@ mod ui;
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 
+const HELP: &str = "\
+luvienne — a keyboard-driven SSH connection manager for the terminal
+
+usage: luvienne [options]
+
+options:
+  -h, --help       print this help and exit
+  -V, --version    print the version and exit
+
+There are no other arguments. Hosts live in an inventory file that is created on
+first run; add them from inside the app or edit the file by hand.
+";
+
+// Hand-rolled on purpose: two flags, neither taking a value, is less surface
+// than a parser crate would carry.
+//
+// Returns the exit code when the process should stop here, `None` to carry on
+// into the app.
+fn handle_args() -> Option<i32> {
+    // Only the first argument is inspected: every flag we accept exits the
+    // process, so a second one could never be reached anyway.
+    //
+    // `args_os`, not `args`: the latter panics on argv that is not valid
+    // unicode, and a stray byte in an argument should produce the usage error
+    // below, not a crash report.
+    let arg = std::env::args_os().nth(1)?;
+    match &*arg.to_string_lossy() {
+        "-h" | "--help" => {
+            print!("{HELP}");
+            Some(0)
+        }
+        "-V" | "--version" => {
+            println!("luvienne {}", env!("CARGO_PKG_VERSION"));
+            Some(0)
+        }
+        other => {
+            eprintln!("luvienne: unrecognised argument: {other}");
+            eprintln!("try 'luvienne --help'");
+            Some(2)
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    // Before anything else touches the terminal or the filesystem, so `--version`
+    // answers in a packaging smoke test where there is no tty and no inventory
+    // file yet.
+    if let Some(code) = handle_args() {
+        std::process::exit(code);
+    }
+
     // Order matters. `ratatui::init` installs a panic hook that restores the
     // terminal, and it must sit on top of color-eyre's so the terminal is back in
     // cooked mode before any report is printed. Install color-eyre first.
