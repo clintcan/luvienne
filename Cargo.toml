@@ -5,6 +5,11 @@ edition = "2024"
 description = "A keyboard-driven SSH connection manager for the terminal"
 repository = "https://github.com/clintcan/luvienne"
 license = "Apache-2.0"
+# Key fixtures for the PuTTY and OpenSSH parsers. Generated, not real secrets,
+# but a published crate is permanent and there is no reason to put key material
+# on crates.io. Excluding them means `cargo test` does not pass from an unpacked
+# .crate; clone the repository to run the suite.
+exclude = ["tests/fixtures/*"]
 
 [dependencies]
 color-eyre = "0.6.5"
