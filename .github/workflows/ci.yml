@@ -103,21 +103,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # Covers the CLI surface too: tests/cli.rs runs the built binary for
+      # --version, --help, a usage error, and the no-terminal path, so none of
+      # that needs restating as shell here.
       - name: Test
         run: cargo test --locked
-
-      # `cargo test` builds the unit-test harness, not the plain binary, so this
-      # builds it once and then runs it directly rather than going back through
-      # cargo for each invocation.
-      - name: Check the CLI runs without a terminal
-        run: |
-          cargo build --locked
-          ./target/debug/luvienne --version
-          # A bare run has no tty here and must explain itself rather than
-          # panic. The phrase comes from the wrap_err in src/main.rs — if you
-          # reword it there, reword it here and in the Homebrew formula's test.
-          if output=$(./target/debug/luvienne 2>&1); then
-            echo "::error::expected a non-zero exit without a terminal"
-            exit 1
-          fi
-          grep -q "needs a terminal" <<<"$output"
