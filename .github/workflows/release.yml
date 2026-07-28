@@ -180,3 +180,41 @@ jobs:
         run: |
           set -euo pipefail
           gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+
+      # Runs only after the upload succeeds, so the notes never describe
+      # binaries that are not there.
+      - name: Document how to verify and unquarantine the binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          marker='<!-- binaries-note -->'
+          body=$(gh release view "$TAG" --json body --jq .body)
+          # A re-run must not stack a second copy of the note.
+          if printf '%s' "$body" | grep -qF "$marker"; then
+            echo "note already present, leaving the body alone"
+            exit 0
+          fi
+          # Quoted heredoc: none of this is expanded by the shell.
+          note=$(cat <<'EOF'
+          <!-- binaries-note -->
+          ## Binaries
+
+          Check a download against `SHA256SUMS`:
+
+          ```sh
+          shasum -a 256 -c SHA256SUMS --ignore-missing
+          ```
+
+          The macOS binaries are ad-hoc signed but not notarized. Fetching with
+          `curl` and unpacking with `tar` works as-is. A browser download is
+          quarantined by macOS and Gatekeeper will refuse to run it, which clears with:
+
+          ```sh
+          xattr -d com.apple.quarantine ./luvienne
+          ```
+          EOF
+          )
+          printf '%s\n\n%s\n' "$body" "$note" | gh release edit "$TAG" --notes-file -
