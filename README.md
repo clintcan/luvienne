@@ -102,6 +102,23 @@ brew install clintcan/tap/luvienne
 To track `main` instead of the latest release, `brew install --HEAD
 clintcan/tap/luvienne`.
 
+Or take a prebuilt binary from the
+[releases page](https://github.com/clintcan/luvienne/releases/latest) — macOS
+and Linux, on both arm64 and x86_64:
+
+```sh
+# Download the archive for your platform alongside SHA256SUMS, then check it
+# before unpacking. --ignore-missing skips the archives you did not download.
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar xzf luvienne-v0.1.0-aarch64-apple-darwin.tar.gz
+install -m 755 luvienne-v0.1.0-aarch64-apple-darwin/luvienne /usr/local/bin/
+```
+
+Fetched this way the binary just runs. Downloaded through a browser it does not:
+macOS quarantines the archive and Gatekeeper blocks it, because these are ad-hoc
+signed rather than notarized. `xattr -d com.apple.quarantine ./luvienne` clears
+the flag.
+
 From source:
 
 ```sh
