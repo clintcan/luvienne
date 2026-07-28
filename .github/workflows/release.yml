@@ -19,14 +19,18 @@ on:
 # so a compromised dependency in the build cannot write to the repository.
 permissions: {}
 
-# Two runs for the same tag would race to upload the same asset names.
+# Two runs for the same tag would race to upload the same asset names. This is
+# the one place the tag expression has to be written out: `concurrency` is
+# evaluated before any job exists, so it cannot read a job's `env`.
 concurrency:
   group: release-${{ github.event.release.tag_name || inputs.tag }}
   cancel-in-progress: false
 
 defaults:
   run:
-    shell: bash
+    # GitHub's own `shell: bash` is this minus `-u`. Spelling it out here means
+    # no step has to open with `set -euo pipefail`, and none can forget to.
+    shell: bash --noprofile --norc -euo pipefail {0}
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,6 +45,10 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    # Resolved once for the job. Every step below just reads $TAG and $TARGET.
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TARGET: ${{ matrix.target }}
     strategy:
       # Report every broken target in one run rather than stopping at the first.
       fail-fast: false
@@ -62,16 +70,25 @@ jobs:
       - name: Check out the release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: ${{ env.TAG }}
           # The build needs no git credentials; leaving the token in
           # .git/config would expose it to anything that runs afterwards.
           persist-credentials: false
 
-      - name: Install the Rust toolchain
-        env:
-          TARGET: ${{ matrix.target }}
+      # First, and deliberately: a tag that disagrees with Cargo.toml would ship
+      # a binary whose --version contradicts the release it is attached to, and
+      # every runner image already has a cargo that can answer this. Behind the
+      # toolchain install it would burn four runners' setup to learn it.
+      - name: Verify the tag matches the crate version
         run: |
-          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$TAG" != "v${version}" ]; then
+            echo "::error::tag ${TAG} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+
+      - name: Install the Rust toolchain
+        run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
           rustup target add "$TARGET"
@@ -82,46 +99,22 @@ jobs:
       - name: Ensure cmake is present
         if: runner.os == 'Linux'
         run: |
-          set -euo pipefail
           command -v cmake >/dev/null && exit 0
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y cmake
 
-      # A tag that disagrees with Cargo.toml would ship a binary whose
-      # --version contradicts the release it is attached to.
-      - name: Verify the tag matches the crate version
-        env:
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
-        run: |
-          set -euo pipefail
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          if [ "$TAG" != "v${version}" ]; then
-            echo "::error::tag ${TAG} does not match Cargo.toml version ${version}"
-            exit 1
-          fi
-
       # --locked: build the dependency versions the tag was tested with, not
       # whatever has been published since.
       - name: Build
-        env:
-          TARGET: ${{ matrix.target }}
         run: cargo build --locked --release --target "$TARGET"
 
       - name: Smoke-test the binary
         # A cross-compiled x86_64 binary will not run on the arm64 runner.
         if: matrix.target != 'x86_64-apple-darwin'
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          "target/${TARGET}/release/luvienne" --version
+        run: '"target/${TARGET}/release/luvienne" --version'
 
       - name: Package
-        env:
-          TARGET: ${{ matrix.target }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          set -euo pipefail
           staging="luvienne-${TAG}-${TARGET}"
           mkdir -p "dist/${staging}"
           cp "target/${TARGET}/release/luvienne" "dist/${staging}/"
@@ -135,6 +128,9 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
+          # The payload is already gzipped; zipping it again costs CPU on both
+          # ends and saves nothing.
+          compression-level: 0
 
   publish:
     name: attach binaries to the release
@@ -150,6 +146,11 @@ jobs:
       # workflow, commit and runner produced these bytes.
       id-token: write
       attestations: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # There is no checkout in this job, so `gh` cannot infer the repository.
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Collect every target's archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -161,7 +162,6 @@ jobs:
       - name: Generate SHA256SUMS
         working-directory: dist
         run: |
-          set -euo pipefail
           # `shasum -a 256` rather than sha256sum: same output format, and it is
           # present on both the Linux and macOS images if this ever moves.
           shasum -a 256 -- *.tar.gz | tee SHA256SUMS
@@ -173,32 +173,25 @@ jobs:
           subject-checksums: dist/SHA256SUMS
 
       - name: Attach the archives to the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
-        run: |
-          set -euo pipefail
-          gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+        run: gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
 
       # Runs only after the upload succeeds, so the notes never describe
       # binaries that are not there.
       - name: Document how to verify and unquarantine the binaries
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          set -euo pipefail
           marker='<!-- binaries-note -->'
           body=$(gh release view "$TAG" --json body --jq .body)
           # A re-run must not stack a second copy of the note.
-          if printf '%s' "$body" | grep -qF "$marker"; then
+          if grep -qF "$marker" <<<"$body"; then
             echo "note already present, leaving the body alone"
             exit 0
           fi
-          # Quoted heredoc: none of this is expanded by the shell.
-          note=$(cat <<'EOF'
+          # Quoted heredoc: none of this is expanded by the shell. Piped
+          # straight out, so nothing has to restore the newline a $(...) would
+          # have stripped.
+          {
+            printf '%s\n\n' "$body"
+            cat <<'EOF'
           <!-- binaries-note -->
           ## Binaries
 
@@ -216,5 +209,4 @@ jobs:
           xattr -d com.apple.quarantine ./luvienne
           ```
           EOF
-          )
-          printf '%s\n\n%s\n' "$body" "$note" | gh release edit "$TAG" --notes-file -
+          } | gh release edit "$TAG" --notes-file -

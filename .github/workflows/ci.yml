@@ -17,7 +17,9 @@ concurrency:
 
 defaults:
   run:
-    shell: bash
+    # GitHub's own `shell: bash` is this minus `-u`. Spelling it out here means
+    # no step has to open with `set -euo pipefail`, and none can forget to.
+    shell: bash --noprofile --norc -euo pipefail {0}
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,7 +41,6 @@ jobs:
 
       - name: Install the Rust toolchain
         run: |
-          set -euo pipefail
           rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
           rustup default stable
 
@@ -55,7 +56,9 @@ jobs:
       fail-fast: false
       matrix:
         # Both operating systems and both architectures, without paying for
-        # four runners: Linux is covered on x86_64, macOS on arm64.
+        # four runners: Linux is covered on x86_64, macOS on arm64. Clippy runs
+        # on both deliberately — src/keystore/mod.rs carries cfg'd variants
+        # whose `allow`s only matter on the platform that cannot construct them.
         runner: [ubuntu-24.04, macos-15]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,37 +67,36 @@ jobs:
 
       - name: Install the Rust toolchain
         run: |
-          set -euo pipefail
           rustup toolchain install stable --profile minimal --component clippy --no-self-update
           rustup default stable
           rustc --version --verbose
-          # Feeds the cache key below, so a toolchain bump does not reuse
-          # artifacts built by the previous compiler.
-          echo "RUSTC_VERSION=$(rustc --version | tr ' /' '--')" >> "$GITHUB_ENV"
 
       # aws-lc-sys, pulled in through russh -> rustls, compiles C and needs cmake.
       - name: Ensure cmake is present
         if: runner.os == 'Linux'
         run: |
-          set -euo pipefail
           command -v cmake >/dev/null && exit 0
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y cmake
 
-      # Worth caching because aws-lc-sys builds C on every cold run. Keyed on
-      # the lockfile and the compiler version, so a dependency or toolchain
-      # bump starts from a clean slate rather than a stale one.
-      - name: Cache the cargo registry and build directory
+      # Downloaded crates only — deliberately not `target`, which is 2.7GB for
+      # this dependency graph. Two matrix legs of that, re-saved whenever
+      # Cargo.lock changes (weekly, via Dependabot), would churn through the
+      # 10GB repository cache limit and start evicting itself. A cold build here
+      # is around 100 seconds, which is not worth that.
+      #
+      # Keyed on the lockfile alone: these are source tarballs and a registry
+      # index, so which compiler is installed has no bearing on them.
+      - name: Cache downloaded crates
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: ${{ matrix.runner }}-${{ env.RUSTC_VERSION }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.runner }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.runner }}-${{ env.RUSTC_VERSION }}-cargo-
+            ${{ matrix.runner }}-cargo-
 
       # --locked throughout: CI must fail when Cargo.lock disagrees with
       # Cargo.toml, which is exactly what a forgotten version bump looks like.
@@ -104,12 +106,17 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # `cargo test` builds the unit-test harness, not the plain binary, so this
+      # builds it once and then runs it directly rather than going back through
+      # cargo for each invocation.
       - name: Check the CLI runs without a terminal
         run: |
-          set -euo pipefail
-          cargo run --locked --quiet -- --version
-          # A bare run has no tty here and must explain itself rather than panic.
-          if output=$(cargo run --locked --quiet 2>&1); then
+          cargo build --locked
+          ./target/debug/luvienne --version
+          # A bare run has no tty here and must explain itself rather than
+          # panic. The phrase comes from the wrap_err in src/main.rs — if you
+          # reword it there, reword it here and in the Homebrew formula's test.
+          if output=$(./target/debug/luvienne 2>&1); then
             echo "::error::expected a non-zero exit without a terminal"
             exit 1
           fi

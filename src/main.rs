@@ -11,10 +11,22 @@ mod ui;
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 
-const HELP: &str = "\
-luvienne — a keyboard-driven SSH connection manager for the terminal
+/// The name and tagline come from `Cargo.toml` rather than being written out
+/// again here. `concat!` folds them at compile time, so this stays a `&'static
+/// str` — and the description cannot drift from the one crates.io and the
+/// Homebrew formula show.
+const HELP: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    " ",
+    env!("CARGO_PKG_VERSION"),
+    "
+",
+    env!("CARGO_PKG_DESCRIPTION"),
+    "
 
-usage: luvienne [options]
+usage: ",
+    env!("CARGO_PKG_NAME"),
+    " [options]
 
 options:
   -h, --help       print this help and exit
@@ -22,7 +34,8 @@ options:
 
 There are no other arguments. Hosts live in an inventory file that is created on
 first run; add them from inside the app or edit the file by hand.
-";
+"
+);
 
 // Hand-rolled on purpose: two flags, neither taking a value, is less surface
 // than a parser crate would carry.
@@ -43,12 +56,13 @@ fn handle_args() -> Option<i32> {
             Some(0)
         }
         "-V" | "--version" => {
-            println!("luvienne {}", env!("CARGO_PKG_VERSION"));
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             Some(0)
         }
         other => {
-            eprintln!("luvienne: unrecognised argument: {other}");
-            eprintln!("try 'luvienne --help'");
+            let name = env!("CARGO_PKG_NAME");
+            eprintln!("{name}: unrecognised argument: {other}");
+            eprintln!("try '{name} --help'");
             Some(2)
         }
     }
