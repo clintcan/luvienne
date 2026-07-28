@@ -1,0 +1,182 @@
+name: release
+
+# Builds macOS and Linux binaries for a published release and attaches them,
+# with a SHA256SUMS file, to that release.
+#
+# `workflow_dispatch` exists so a failed release build can be re-run against an
+# existing tag without deleting and recreating the release.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and attach binaries to, e.g. v0.1.0
+        required: true
+        type: string
+
+# No token permissions by default. Each job opts in to exactly what it needs,
+# so a compromised dependency in the build cannot write to the repository.
+permissions: {}
+
+# Two runs for the same tag would race to upload the same asset names.
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing is reused between these one-shot runners, so incremental state is
+  # only overhead.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      # Report every broken target in one run rather than stopping at the first.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          # Cross-compiled from the arm64 runner: the macOS SDK carries both
+          # slices, and this avoids depending on an Intel runner image.
+          - target: x86_64-apple-darwin
+            runner: macos-15
+    steps:
+      # Checkout is pinned to the released tag, not to a branch, so a push to
+      # main between tagging and this run cannot change what ships.
+      - name: Check out the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          # The build needs no git credentials; leaving the token in
+          # .git/config would expose it to anything that runs afterwards.
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "$TARGET"
+          rustc --version --verbose
+
+      # aws-lc-sys, pulled in through russh -> rustls, compiles C and needs
+      # cmake. The x86_64 image ships it; the arm64 image is slimmer.
+      - name: Ensure cmake is present
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          command -v cmake >/dev/null && exit 0
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y cmake
+
+      # A tag that disagrees with Cargo.toml would ship a binary whose
+      # --version contradicts the release it is attached to.
+      - name: Verify the tag matches the crate version
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$TAG" != "v${version}" ]; then
+            echo "::error::tag ${TAG} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+
+      # --locked: build the dependency versions the tag was tested with, not
+      # whatever has been published since.
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET"
+
+      - name: Smoke-test the binary
+        # A cross-compiled x86_64 binary will not run on the arm64 runner.
+        if: matrix.target != 'x86_64-apple-darwin'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          "target/${TARGET}/release/luvienne" --version
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          staging="luvienne-${TAG}-${TARGET}"
+          mkdir -p "dist/${staging}"
+          cp "target/${TARGET}/release/luvienne" "dist/${staging}/"
+          cp LICENSE README.md hosts.example.toml "dist/${staging}/"
+          tar -C dist -czf "dist/${staging}.tar.gz" "${staging}"
+
+      - name: Upload the archive for the publish job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: luvienne-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: attach binaries to the release
+    # Skipped if any target failed, so a release never gets a partial set.
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      # Upload release assets.
+      contents: write
+      # The two below are what attest-build-provenance needs to sign and record
+      # a provenance statement for each archive: a verifiable claim about which
+      # workflow, commit and runner produced these bytes.
+      id-token: write
+      attestations: write
+    steps:
+      - name: Collect every target's archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: luvienne-*
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # `shasum -a 256` rather than sha256sum: same output format, and it is
+          # present on both the Linux and macOS images if this ever moves.
+          shasum -a 256 -- *.tar.gz | tee SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+
+      - name: Attest what was built
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Attach the archives to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
