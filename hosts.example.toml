@@ -1,0 +1,68 @@
+# Copy to ~/.config/luvienne/hosts.toml
+#
+# This file holds references to credentials, never credentials themselves.
+# There is no `password = "..."` field and there never will be — passphrases come
+# from the agent, the macOS Keychain, or a prompt at connect time.
+
+[[host]]
+name = "web-01"
+address = "10.0.1.10"
+user = "deploy"
+tags = ["prod", "web"]
+# No `auth` key means the SSH agent, which is the preferred method: the key
+# never leaves the agent.
+
+[[host]]
+name = "db-01"
+address = "10.0.1.20"
+port = 2222
+user = "postgres"
+tags = ["prod", "db"]
+auth = { method = "key", path = "~/.ssh/id_ed25519" }
+# Port forwards, raised with the session and torn down with it. They keep
+# working while the session is detached, which is the point of having them.
+#
+#   direction = "local"   we listen here; the server connects onward.
+#   direction = "remote"  the server listens; we connect onward.
+#
+# `listen_host` defaults to 127.0.0.1 and is left out above for that reason.
+# Set it to "0.0.0.0" only if you mean to expose the far end to your whole
+# network — a local forward on every interface publishes whatever is at the
+# other end to anyone who can reach this machine.
+forwards = [
+  # psql -h 127.0.0.1 -p 15432, talking to the database's own loopback.
+  { direction = "local", listen_port = 15432, to_host = "127.0.0.1", to_port = 5432 },
+  # The server can reach a dev server running on this laptop at its :9000.
+  { direction = "remote", listen_port = 9000, to_host = "127.0.0.1", to_port = 3000 },
+]
+
+[[host]]
+name = "legacy-win"
+address = "10.0.2.5"
+user = "administrator"
+tags = ["legacy"]
+# PuTTY keys are detected by content, so `method = "key"` covers .ppk (v2 and
+# v3) as well as OpenSSH and PEM.
+auth = { method = "key", path = "~/keys/legacy.ppk" }
+# Keep this key's passphrase in the macOS Keychain instead of typing it every
+# connect. Off unless set, and it governs reading too: a host without it is
+# asked even when the same key file is already remembered for another host.
+# The entry is keyed by key file, so hosts sharing a key share one passphrase.
+# Turning this off deletes what was stored.
+cache_passphrase = true
+
+# Reached by tunnelling through web-01, which is the only machine that can
+# see it. The tunnel is end-to-end: web-01 forwards bytes it cannot read.
+[[host]]
+name = "staging-app"
+address = "10.0.9.4"
+user = "ubuntu"
+tags = ["staging", "web"]
+jump = "web-01"
+
+[[host]]
+name = "router"
+address = "192.168.1.1"
+user = "admin"
+tags = ["lab"]
+auth = { method = "password" }
