@@ -90,15 +90,29 @@ Both are real frames rendered by the app, with invented hosts.
   the option is simply absent elsewhere; everything else works on both.
 - A terminal emulator — Terminal.app, iTerm2, Ghostty and WezTerm all work.
   This is a TUI, not a native GUI app.
-- A stable Rust toolchain to build it.
+- A stable Rust toolchain, if you are building from source rather than
+  installing a package.
 
-## Getting started
+## Install
 
 ```sh
-git clone <this repo>
-cd luvienne
-cargo run
+brew install clintcan/tap/luvienne
 ```
+
+To track `main` instead of the latest release, `brew install --HEAD
+clintcan/tap/luvienne`.
+
+From source:
+
+```sh
+git clone https://github.com/clintcan/luvienne.git
+cd luvienne
+cargo install --path .
+```
+
+Or `cargo run` in the clone to try it without installing.
+
+## Getting started
 
 On first run there are no hosts and the app says so. Press `a` to add one, or
 write the file by hand — `~/.config/luvienne/hosts.toml`:
