@@ -1,0 +1,116 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Nothing here writes to the repository, so no job asks for more than read.
+permissions: {}
+
+# A newer push to the same branch makes the running one irrelevant. This is the
+# opposite of the release workflow, where a run must never be cancelled midway.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Formatting is platform-independent, so it runs once rather than per target.
+  # Split out from `test` so a stray tab fails in seconds instead of after a
+  # full dependency build.
+  fmt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
+          rustup default stable
+
+      - run: cargo fmt --all --check
+
+  test:
+    name: test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both operating systems and both architectures, without paying for
+        # four runners: Linux is covered on x86_64, macOS on arm64.
+        runner: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component clippy --no-self-update
+          rustup default stable
+          rustc --version --verbose
+          # Feeds the cache key below, so a toolchain bump does not reuse
+          # artifacts built by the previous compiler.
+          echo "RUSTC_VERSION=$(rustc --version | tr ' /' '--')" >> "$GITHUB_ENV"
+
+      # aws-lc-sys, pulled in through russh -> rustls, compiles C and needs cmake.
+      - name: Ensure cmake is present
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          command -v cmake >/dev/null && exit 0
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y cmake
+
+      # Worth caching because aws-lc-sys builds C on every cold run. Keyed on
+      # the lockfile and the compiler version, so a dependency or toolchain
+      # bump starts from a clean slate rather than a stale one.
+      - name: Cache the cargo registry and build directory
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ matrix.runner }}-${{ env.RUSTC_VERSION }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.runner }}-${{ env.RUSTC_VERSION }}-cargo-
+
+      # --locked throughout: CI must fail when Cargo.lock disagrees with
+      # Cargo.toml, which is exactly what a forgotten version bump looks like.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Check the CLI runs without a terminal
+        run: |
+          set -euo pipefail
+          cargo run --locked --quiet -- --version
+          # A bare run has no tty here and must explain itself rather than panic.
+          if output=$(cargo run --locked --quiet 2>&1); then
+            echo "::error::expected a non-zero exit without a terminal"
+            exit 1
+          fi
+          grep -q "needs a terminal" <<<"$output"
