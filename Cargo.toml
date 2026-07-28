@@ -1,6 +1,6 @@
 [package]
 name = "luvienne"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A keyboard-driven SSH connection manager for the terminal"
 repository = "https://github.com/clintcan/luvienne"

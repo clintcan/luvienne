@@ -110,8 +110,8 @@ and Linux, on both arm64 and x86_64:
 # Download the archive for your platform alongside SHA256SUMS, then check it
 # before unpacking. --ignore-missing skips the archives you did not download.
 shasum -a 256 -c SHA256SUMS --ignore-missing
-tar xzf luvienne-v0.1.0-aarch64-apple-darwin.tar.gz
-install -m 755 luvienne-v0.1.0-aarch64-apple-darwin/luvienne /usr/local/bin/
+tar xzf luvienne-v0.1.1-aarch64-apple-darwin.tar.gz
+install -m 755 luvienne-v0.1.1-aarch64-apple-darwin/luvienne /usr/local/bin/
 ```
 
 Fetched this way the binary just runs. Downloaded through a browser it does not:
