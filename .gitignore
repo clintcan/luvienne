@@ -1,1 +1,4 @@
 /target
+
+# macOS drops these into any directory opened in Finder.
+.DS_Store
