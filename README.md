@@ -131,6 +131,18 @@ Or `cargo run` in the clone to try it without installing.
 
 ## Getting started
 
+Run `luvienne` to open on the host list, or name a host to connect straight to
+it:
+
+```sh
+luvienne db-primary
+```
+
+That is the same as selecting it in the list, so the jump chain, forwards and
+authentication all behave identically; detaching with `Ctrl-]` drops you into
+the list rather than back to your shell. A name that is not in the inventory is
+reported on stderr before the terminal is taken over.
+
 On first run there are no hosts and the app says so. Press `a` to add one, or
 write the file by hand — `~/.config/luvienne/hosts.toml`:
 

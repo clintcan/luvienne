@@ -26,55 +26,82 @@ const HELP: &str = concat!(
 
 usage: ",
     env!("CARGO_PKG_NAME"),
-    " [options]
+    " [options] [host]
 
 options:
   -h, --help       print this help and exit
   -V, --version    print the version and exit
 
-There are no other arguments. Hosts live in an inventory file that is created on
-first run; add them from inside the app or edit the file by hand.
+Naming a host connects to it straight away, exactly as selecting it in the list
+would; detaching drops you back into the list. Without one, luvienne opens on
+the list.
+
+Hosts live in an inventory file that is created on first run; add them from
+inside the app or edit the file by hand.
 "
 );
 
-// Hand-rolled on purpose: two flags, neither taking a value, is less surface
-// than a parser crate would carry.
-//
-// Returns the exit code when the process should stop here, `None` to carry on
-// into the app.
-fn handle_args() -> Option<i32> {
-    // Only the first argument is inspected: every flag we accept exits the
-    // process, so a second one could never be reached anyway.
-    //
+/// What the command line asked for.
+enum Args {
+    /// Print something and stop, with this exit code.
+    Exit(i32),
+    /// Open the app, connecting to this host straight away if one was named.
+    Run { target: Option<String> },
+}
+
+// Hand-rolled on purpose: two flags and one optional operand, none of them
+// taking a value, is less surface than a parser crate would carry.
+fn handle_args() -> Args {
     // `args_os`, not `args`: the latter panics on argv that is not valid
     // unicode, and a stray byte in an argument should produce the usage error
     // below, not a crash report.
-    let arg = std::env::args_os().nth(1)?;
-    match &*arg.to_string_lossy() {
+    let mut args = std::env::args_os().skip(1);
+    let Some(first) = args.next() else {
+        return Args::Run { target: None };
+    };
+
+    // At most one. Every flag exits, and a second host name has no meaning —
+    // there is one terminal to attach to.
+    if args.next().is_some() {
+        return usage_error("expected at most one argument");
+    }
+
+    match &*first.to_string_lossy() {
         "-h" | "--help" => {
             print!("{HELP}");
-            Some(0)
+            Args::Exit(0)
         }
         "-V" | "--version" => {
             println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-            Some(0)
+            Args::Exit(0)
         }
-        other => {
-            let name = env!("CARGO_PKG_NAME");
-            eprintln!("{name}: unrecognised argument: {other}");
-            eprintln!("try '{name} --help'");
-            Some(2)
-        }
+        // A leading dash means a mistyped flag, not a host. Inventory names do
+        // not start with one, and accepting it would report "no host called
+        // --verbose" — an answer that sends the reader to the wrong file.
+        other if other.starts_with('-') => usage_error(&format!("unrecognised argument: {other}")),
+        host => Args::Run {
+            target: Some(host.to_string()),
+        },
     }
+}
+
+/// Exit 2, not 1: a usage error is not a crash, and `main`'s `Result` can only
+/// ever produce 1.
+fn usage_error(problem: &str) -> Args {
+    let name = env!("CARGO_PKG_NAME");
+    eprintln!("{name}: {problem}");
+    eprintln!("try '{name} --help'");
+    Args::Exit(2)
 }
 
 fn main() -> Result<()> {
     // Before anything else touches the terminal or the filesystem, so `--version`
     // answers in a packaging smoke test where there is no tty and no inventory
     // file yet.
-    if let Some(code) = handle_args() {
-        std::process::exit(code);
-    }
+    let target = match handle_args() {
+        Args::Exit(code) => std::process::exit(code),
+        Args::Run { target } => target,
+    };
 
     // Order matters. `ratatui::init` installs a panic hook that restores the
     // terminal, and it must sit on top of color-eyre's so the terminal is back in
@@ -99,6 +126,17 @@ fn main() -> Result<()> {
     config::Inventory::migrate_from_former_name(&inventory_path);
     let inventory = config::Inventory::load_from(&inventory_path)?;
 
+    // Resolved before the terminal is taken over, so a mistyped name is a line
+    // on stderr rather than an error flashed inside a TUI that then sits there
+    // waiting to be quit. `connection_chain` also catches an unreachable jump
+    // host, which is the other way a named host cannot be connected to.
+    if let Some(name) = &target
+        && let Err(err) = inventory.connection_chain(name)
+    {
+        eprintln!("{}: {err}", env!("CARGO_PKG_NAME"));
+        std::process::exit(1);
+    }
+
     // The SSH side is async; the render loop is not. The runtime lives here and
     // background work reports back through a channel the loop drains without blocking.
     // Two workers, not one per core. The work here is a handful of I/O-bound
@@ -119,8 +157,14 @@ fn main() -> Result<()> {
     let _ = ui::push_title();
     let _ = ui::set_title(ui::APP_TITLE);
 
-    let result =
-        app::App::new(inventory, inventory_path, runtime.handle().clone()).run(&mut terminal);
+    let mut app = app::App::new(inventory, inventory_path, runtime.handle().clone());
+    // The dial runs on the runtime and reports through the same event channel
+    // as any other connect, so the loop below picks up its progress, its host
+    // key prompt and its failures without knowing this one started early.
+    if let Some(name) = &target {
+        app.connect_to(name);
+    }
+    let result = app.run(&mut terminal);
 
     ratatui::restore();
     // `ratatui::restore` leaves the cursor hidden and the title ours.

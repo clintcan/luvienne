@@ -22,6 +22,12 @@ The visual target is "modern and slick" in the TUI sense:
 - Truecolor when the terminal advertises it, graceful 256-color fallback.
 - Every action reachable by keyboard; the mouse is a convenience, never a requirement.
 - Fuzzy filter over hosts as the primary navigation tool.
+- **`luvienne <host>` is a shortcut into the list, not a second way to connect.**
+  It selects the host and calls the same `connect_selected` path, so there is one
+  connect implementation to reason about and detaching lands in the list like any
+  other session. The name is resolved against the inventory in `main`, before
+  `ratatui::try_init`: a typo has to be a line on stderr, because a full-screen
+  app reporting it would then sit there waiting to be quit.
 - **The window title is ours to set.** A terminal program inherits whatever title
   the shell left, which is why this showed up as "Terminal". `main` saves the old
   title (XTWINOPS `CSI 22;0t`), sets `luvienne`, and restores it on exit and in

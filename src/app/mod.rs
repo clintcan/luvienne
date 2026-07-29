@@ -954,6 +954,21 @@ impl App {
         self.selected = self.selected.min(last);
     }
 
+    /// Select `name` and start connecting to it, as `luvienne <host>` does.
+    ///
+    /// Returns whether a host by that name was found. The caller checks the
+    /// name against the inventory first, so a `false` here means the host is
+    /// filtered out of view rather than missing — which cannot happen at
+    /// startup, where no filter is set.
+    pub fn connect_to(&mut self, name: &str) -> bool {
+        let Some(index) = self.visible().iter().position(|host| host.name == name) else {
+            return false;
+        };
+        self.selected = index;
+        self.connect_selected();
+        true
+    }
+
     fn connect_selected(&mut self) {
         let Some(host) = self.selected_host().cloned() else {
             return;
@@ -1910,6 +1925,44 @@ mod tests {
             matches!(&app.status, Status::Busy(m) if m.contains("still connecting")),
             "should say it is already dialling, got {:?}",
             app.status
+        );
+    }
+
+    /// `luvienne <host>` must dial the host it was given, not whichever one the
+    /// list happens to open on. The selection follows too, so detaching lands on
+    /// the host you just left rather than somewhere unrelated.
+    #[test]
+    fn connect_to_dials_the_named_host_rather_than_the_selected_one() {
+        let mut app = fresh_app(
+            "cliconnect",
+            vec![host("web-01", &[]), host("db-primary", &[])],
+        );
+        assert_eq!(app.selected, 0, "expected to open on the first host");
+
+        assert!(app.connect_to("db-primary"), "the host was not found");
+
+        assert!(
+            app.connecting.contains_key("db-primary"),
+            "dialled {:?} instead",
+            app.connecting.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.selected_host().map(|h| h.name.as_str()),
+            Some("db-primary"),
+            "the list selection did not follow"
+        );
+    }
+
+    /// The binary checks the name against the inventory before it gets here, so
+    /// this is the belt-and-braces case: report it and dial nothing.
+    #[test]
+    fn connect_to_an_absent_host_dials_nothing() {
+        let mut app = fresh_app("cliabsent", vec![host("web-01", &[])]);
+
+        assert!(!app.connect_to("no-such-box"));
+        assert!(
+            app.connecting.is_empty(),
+            "started a connection for a host that does not exist"
         );
     }
 
