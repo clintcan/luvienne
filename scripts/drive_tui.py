@@ -1,25 +1,55 @@
 #!/usr/bin/env python3
 """Drive the luvienne TUI on a real pty and record what it draws.
 
-Usage: drive_tui.py <binary> [script...]
+Usage: drive_tui.py <binary> [script...] [-- <binary arg>...]
 Script steps are "delay:keys" pairs, e.g. "1.0:\\r" "3:y".
+
+Anything after `--` is passed to the binary rather than read as a step, which is
+how you drive `luvienne <host>`:
+
+    drive_tui.py ./target/debug/luvienne "3:y" "3:echo hi\\r" -- docker-test
 """
 import fcntl, os, pty, re, select, struct, subprocess, sys, termios, time
 
 ROWS, COLS = 40, 120
 
-def main():
-    binary = sys.argv[1]
+def parse_args(argv):
+    """Split argv into (binary, steps, binary_args)."""
+    if not argv:
+        sys.exit("drive_tui: need a binary to run\n" + __doc__)
+    binary, rest = argv[0], argv[1:]
+
+    # Steps stay first so every existing invocation reads unchanged.
+    if "--" in rest:
+        cut = rest.index("--")
+        step_args, binary_args = rest[:cut], rest[cut + 1:]
+    else:
+        step_args, binary_args = rest, []
+
     steps = []
-    for arg in sys.argv[2:]:
-        delay, _, keys = arg.partition(":")
-        steps.append((float(delay), keys.encode().decode("unicode_escape")))
+    for arg in step_args:
+        delay, sep, keys = arg.partition(":")
+        # Catching this here turns the likeliest mistake — writing the host name
+        # as though it were a step — into an answer rather than a traceback.
+        if not sep:
+            sys.exit(f"drive_tui: {arg!r} is not a delay:keys step; "
+                     "arguments for the binary go after `--`")
+        try:
+            seconds = float(delay)
+        except ValueError:
+            sys.exit(f"drive_tui: {delay!r} in {arg!r} is not a number of seconds")
+        steps.append((seconds, keys.encode().decode("unicode_escape")))
+
+    return binary, steps, binary_args
+
+def main():
+    binary, steps, binary_args = parse_args(sys.argv[1:])
 
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 
     proc = subprocess.Popen(
-        [binary], stdin=slave, stdout=slave, stderr=slave,
+        [binary, *binary_args], stdin=slave, stdout=slave, stderr=slave,
         close_fds=True, env={**os.environ, "TERM": "xterm-256color"},
     )
     os.close(slave)
@@ -57,7 +87,10 @@ def main():
     except subprocess.TimeoutExpired:
         proc.kill()
 
-    print(f"[driver] exit={proc.returncode} died_at={died_at}", file=sys.stderr)
+    # The command is echoed so a recorded run says what produced it — the same
+    # steps against `luvienne` and `luvienne <host>` draw different things.
+    ran = " ".join([binary, *binary_args])
+    print(f"[driver] ran={ran!r} exit={proc.returncode} died_at={died_at}", file=sys.stderr)
 
     text = captured.decode("utf-8", "replace")
     # Strip CSI/OSC escapes so assertions run against what a human would read.

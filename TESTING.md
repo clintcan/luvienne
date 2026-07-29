@@ -259,6 +259,15 @@ python3 scripts/drive_tui.py ./target/debug/luvienne \
 Each argument is `delay_seconds:keys`. Use it to reproduce a sequence without
 typing it by hand.
 
+Anything after `--` goes to the binary instead of being read as a step, which is
+how you drive `luvienne <host>` — it starts connecting immediately, so the first
+thing you answer is the host key prompt rather than the list:
+
+```sh
+python3 scripts/drive_tui.py ./target/debug/luvienne \
+  "3:y" "3:echo HELLO\r" "2:\x1d" -- docker-test
+```
+
 **Recreate the fixture config before every driven run.** Stray keystrokes land in
 the host list, where `d`/`y` deletes and `i`/`y` imports — a run that fails early
 will rewrite the very config the next run depends on, and you will chase a bug in
