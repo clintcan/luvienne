@@ -68,7 +68,8 @@ Both are real frames rendered by the app, with invented hosts.
 - **Sessions outlive an attach.** `Ctrl-]` detaches and leaves the remote shell
   running; resume it later, including into full-screen programs like `vim` or
   `mc`. Idle connections are probed so a session that has quietly died is never
-  offered for resume.
+  offered for resume. `s` lists what is detached once you have more than a
+  couple to keep track of.
 - **Four ways to authenticate**: SSH agent, private key files (OpenSSH, PEM and
   PuTTY `.ppk` v2/v3), passwords, and keyboard-interactive — including servers
   that demand more than one of them.
@@ -177,6 +178,7 @@ See [`hosts.example.toml`](hosts.example.toml) for every field, commented.
 | --- | --- |
 | `↵` | connect, or resume a detached session |
 | `Ctrl-]` | detach, leaving the remote shell running |
+| `s` | list detached sessions; `↵` resumes one, `esc` goes back |
 | `/` | filter; `esc` clears it |
 | `t` | cycle the category filter |
 | `j` `k` or `↓` `↑` | move |

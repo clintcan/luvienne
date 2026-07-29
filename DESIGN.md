@@ -78,6 +78,21 @@ we restore the alternate screen and return to the host list.
 **A session outlives any one attach.** `Ctrl-]` detaches back to the host list
 leaving the remote shell running; the list marks it `●` and `↵` resumes it.
 
+`s` opens a dedicated list of detached sessions (`Mode::SessionList`), which is a
+view over the same `sessions` vector rather than a second place sessions live —
+`↵` there sets the same `pending_attach` the host list does. It exists because
+`●` scales badly: with several sessions running you are scanning a host list for
+markers rather than reading a list of what is actually open. Selection is clamped
+in `prune_dead_sessions`, so a session ending under the cursor cannot leave the
+index past the end.
+
+**Restoring the terminal resets its colour** (`ui::resume`). `Theme::base` sets no
+background so the terminal's own theme and transparency show through, which means
+every cell we draw inherits the SGR state we are handed back. A remote program
+that paints its own background and exits without resetting — `mc`, blue — would
+otherwise leave the host list drawn on it. `ui::suspend` resets on the way out
+too, since only a *first* attach prints the banner that would have cleared it.
+
 `ssh/session.rs` owns the channel in its own task and always drains it. If the
 foreground simply stopped reading while detached, the channel queue would fill,
 the russh session task would block inside that send, and the whole connection —
