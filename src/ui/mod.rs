@@ -8,6 +8,7 @@ pub mod theme;
 use ratatui::Frame;
 use ratatui::crossterm::cursor::{Hide, Show};
 use ratatui::crossterm::execute;
+use ratatui::crossterm::style::ResetColor;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, SetTitle};
 use std::io::Write;
 
@@ -30,12 +31,34 @@ use theme::Theme;
 /// ask for it back — leaving it hidden means typing into a session with no
 /// visible cursor.
 pub fn suspend() -> std::io::Result<()> {
-    execute!(std::io::stdout(), LeaveAlternateScreen, Show)
+    // Reset before letting go, so our own styling cannot bleed into the first
+    // thing the remote writes. On a *resume* nothing else clears it — the
+    // "ctrl-] detaches" banner ends in a reset, but that only prints on a first
+    // attach.
+    suspend_to(&mut std::io::stdout())
 }
 
 /// Take the terminal back after a session ends. Must run on every exit path.
+///
+/// `ResetColor` is load-bearing rather than tidiness. `Theme::base` deliberately
+/// sets no background so the terminal's own theme and transparency show through,
+/// which means every cell we draw without one inherits whatever SGR state the
+/// terminal is left in. A remote program that paints its own background and does
+/// not reset on exit — `mc` is the obvious one, blue — hands us a terminal whose
+/// default background *is* blue, and the host list comes back blue with it.
 pub fn resume() -> std::io::Result<()> {
-    execute!(std::io::stdout(), EnterAlternateScreen, Hide)
+    resume_to(&mut std::io::stdout())
+}
+
+// Split out so the emitted bytes can be asserted. These go straight to stdout
+// rather than through ratatui, so `TestBackend` never sees them and the reset
+// below is exactly the kind of line a later tidy-up removes as redundant.
+fn suspend_to(out: &mut impl Write) -> std::io::Result<()> {
+    execute!(out, ResetColor, LeaveAlternateScreen, Show)
+}
+
+fn resume_to(out: &mut impl Write) -> std::io::Result<()> {
+    execute!(out, EnterAlternateScreen, ResetColor, Hide)
 }
 
 /// The window title while browsing.
@@ -93,7 +116,11 @@ pub fn render(app: &App, frame: &mut Frame) {
         .split(chunks[1]);
 
     render_tags(app, &theme, frame, body[0]);
-    render_hosts(app, &theme, frame, body[1]);
+    if app.mode == Mode::SessionList {
+        render_sessions(app, &theme, frame, body[1]);
+    } else {
+        render_hosts(app, &theme, frame, body[1]);
+    }
     render_status(app, &theme, frame, chunks[2]);
 
     match app.mode {
@@ -641,6 +668,10 @@ fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
             ),
             Span::styled("▌", theme.key_hint()),
         ]),
+        Mode::SessionList => Line::from(vec![Span::styled(
+            "  ↵ resume session   esc back to hosts",
+            theme.dimmed(),
+        )]),
         _ if !app.filter.is_empty() => Line::from(vec![
             Span::styled("  filter: ", theme.dimmed()),
             Span::styled(app.filter.clone(), theme.base()),
@@ -806,6 +837,53 @@ fn name_column_width(longest_name: usize) -> u16 {
     u16::try_from(longest_name.saturating_add(MARKER))
         .unwrap_or(u16::MAX)
         .max(FLOOR)
+}
+
+fn render_sessions(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let viewport = area.height.saturating_sub(3) as usize;
+    let offset = app
+        .session_selected
+        .saturating_sub(viewport.saturating_sub(1));
+
+    let rows: Vec<Row> = app
+        .sessions
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(viewport)
+        .map(|(i, session)| {
+            let style = if i == app.session_selected {
+                theme.selected()
+            } else {
+                theme.base()
+            };
+            Row::new(vec![format!("  {}", session.host), "detached".to_string()]).style(style)
+        })
+        .collect();
+
+    let title = format!(" sessions ({}) ", app.sessions.len());
+    let block = Block::bordered()
+        .border_type(theme.border)
+        .border_style(theme.border_style())
+        .title(Span::styled(title, theme.title()));
+
+    if app.sessions.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("no active sessions", theme.dimmed()))
+                .alignment(Alignment::Center)
+                .block(block),
+            area,
+        );
+        return;
+    }
+
+    let table = Table::new(rows, [Constraint::Min(16), Constraint::Min(12)])
+        .header(Row::new(vec!["  name", "state"]).style(theme.dimmed()))
+        .block(block);
+
+    frame.render_widget(table, area);
+    let track = scroll_track(area, 2, viewport);
+    render_scrollbar(theme, frame, track, app.sessions.len(), offset);
 }
 
 fn render_hosts(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
@@ -1798,5 +1876,101 @@ mod tests {
         assert!(out.contains(fingerprint), "got:\n{out}");
         assert!(out.contains("not in known_hosts"));
         assert!(out.contains("accept and remember"));
+    }
+
+    /// Entering the alternate screen does not clear the terminal's SGR state, and
+    /// `Theme::base` sets no background on purpose — so a remote program that
+    /// paints its own background and exits without resetting (`mc`, blue) leaves
+    /// us drawing the host list on *its* background. The reset has to come after
+    /// we retake the screen, or there is nothing to reset yet.
+    #[test]
+    fn resume_resets_colour_after_retaking_the_screen() {
+        let mut out = Vec::new();
+        super::resume_to(&mut out).unwrap();
+        let seq = String::from_utf8(out).unwrap();
+
+        let enter = seq
+            .find("\x1b[?1049h")
+            .expect("does not enter the alternate screen");
+        let reset = seq.find("\x1b[0m").expect("does not reset colour");
+        assert!(
+            reset > enter,
+            "reset must follow entering the screen, got {seq:?}"
+        );
+    }
+
+    /// The mirror case. Only a *first* attach prints the "ctrl-] detaches"
+    /// banner, which ends in a reset — so on a resume this is the only thing
+    /// stopping our styling bleeding into the remote's first output.
+    #[test]
+    fn suspend_resets_colour_before_handing_the_terminal_over() {
+        let mut out = Vec::new();
+        super::suspend_to(&mut out).unwrap();
+        let seq = String::from_utf8(out).unwrap();
+
+        let leave = seq
+            .find("\x1b[?1049l")
+            .expect("does not leave the alternate screen");
+        let reset = seq.find("\x1b[0m").expect("does not reset colour");
+        assert!(
+            reset < leave,
+            "reset must precede handing the terminal over, got {seq:?}"
+        );
+    }
+
+    #[test]
+    fn session_list_renders_active_sessions() {
+        let mut app = app_with(vec![]);
+        app.sessions.push(ssh::LiveSession::for_test("alpha").0);
+        app.sessions.push(ssh::LiveSession::for_test("beta").0);
+        app.mode = Mode::SessionList;
+
+        let out = draw(&app, 100, 24);
+        assert!(out.contains("sessions (2)"), "title with count:\n{out}");
+        assert!(out.contains("alpha"), "first session shown:\n{out}");
+        assert!(out.contains("beta"), "second session shown:\n{out}");
+        assert!(out.contains("detached"), "state shown:\n{out}");
+    }
+
+    #[test]
+    fn session_list_shows_a_hint_when_empty() {
+        let mut app = app_with(vec![]);
+        app.mode = Mode::SessionList;
+
+        let out = draw(&app, 100, 24);
+        assert!(out.contains("no active sessions"), "got:\n{out}");
+    }
+
+    #[test]
+    fn session_list_header_hints_resume_and_back() {
+        let mut app = app_with(vec![]);
+        app.sessions.push(ssh::LiveSession::for_test("alpha").0);
+        app.mode = Mode::SessionList;
+
+        let out = draw(&app, 100, 24);
+        assert!(out.contains("resume session"), "got:\n{out}");
+        assert!(out.contains("esc back to hosts"), "got:\n{out}");
+    }
+
+    /// The same scrolling rule as the host list: the selected item must stay
+    /// on screen when the list overflows.
+    #[test]
+    fn the_selected_session_stays_visible_when_the_list_overflows() {
+        let mut app = app_with(vec![]);
+        for i in 0..40 {
+            app.sessions
+                .push(ssh::LiveSession::for_test(&format!("session-{i:02}")).0);
+        }
+        app.mode = Mode::SessionList;
+
+        for selected in [0usize, 5, 20, 38, 39] {
+            app.session_selected = selected;
+            let out = draw(&app, 100, 24);
+            let name = format!("session-{selected:02}");
+            assert!(
+                out.contains(&name),
+                "selected {name} is not on screen:\n{out}"
+            );
+        }
     }
 }

@@ -49,6 +49,8 @@ pub enum Mode {
     FilePicker,
     /// Confirming a PuTTY import.
     ConfirmImport,
+    /// Browsing active detached sessions.
+    SessionList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +68,7 @@ pub enum Action {
     DeleteHost,
     ImportPutty,
     BulkEdit,
+    ShowSessions,
 }
 
 /// The one place key bindings are declared. Dispatch reads it and so does the
@@ -96,6 +99,7 @@ pub const BINDINGS: &[(KeyCode, &str, &str, Action)] = &[
     (KeyCode::Char('d'), "d", "delete host", Action::DeleteHost),
     (KeyCode::Char('i'), "i", "import hosts", Action::ImportPutty),
     (KeyCode::Char('b'), "b", "bulk edit shown", Action::BulkEdit),
+    (KeyCode::Char('s'), "s", "sessions", Action::ShowSessions),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +157,8 @@ pub struct App {
     pub filter: String,
     /// Index into the *visible* host list, not into `inventory.hosts`.
     pub selected: usize,
+    /// Index into `sessions` for the dedicated session list view.
+    pub session_selected: usize,
     pub tag_filter: Option<String>,
     pub status: Status,
     pub host_key_prompt: Option<PendingHostKey>,
@@ -200,6 +206,7 @@ impl App {
             mode: Mode::Browse,
             filter: String::new(),
             selected: 0,
+            session_selected: 0,
             tag_filter: None,
             status: Status::Idle,
             host_key_prompt: None,
@@ -506,6 +513,7 @@ impl App {
     fn prune_dead_sessions(&mut self) -> bool {
         let before = self.sessions.len();
         self.sessions.retain(|s| !s.has_ended());
+        self.clamp_session_selection();
         self.sessions.len() != before
     }
 
@@ -681,6 +689,18 @@ impl App {
                 }
             }
 
+            Mode::SessionList => match key.code {
+                KeyCode::Esc => self.mode = Mode::Browse,
+                KeyCode::Enter => self.resume_selected_session(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.session_selected = self.session_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let last = self.sessions.len().saturating_sub(1);
+                    self.session_selected = (self.session_selected + 1).min(last);
+                }
+                _ => {}
+            },
             Mode::Help => {
                 // Any key dismisses help.
                 self.mode = Mode::Browse;
@@ -756,7 +776,35 @@ impl App {
                     self.mode = Mode::ConfirmDelete;
                 }
             }
+            Action::ShowSessions => self.show_sessions(),
         }
+    }
+
+    /// Open the session list, or explain why there is nothing to list.
+    fn show_sessions(&mut self) {
+        if self.sessions.is_empty() {
+            self.status = Status::Error("no active sessions".into());
+            return;
+        }
+        self.clamp_session_selection();
+        self.mode = Mode::SessionList;
+    }
+
+    fn clamp_session_selection(&mut self) {
+        let last = self.sessions.len().saturating_sub(1);
+        self.session_selected = self.session_selected.min(last);
+    }
+
+    /// Resume whichever session is selected in the session list.
+    fn resume_selected_session(&mut self) {
+        self.clamp_session_selection();
+        let Some(session) = self.sessions.get(self.session_selected) else {
+            self.status = Status::Error("no active sessions".into());
+            return;
+        };
+        self.status = Status::Busy(format!("resuming {}…", session.host));
+        self.pending_attach = Some(self.session_selected);
+        self.mode = Mode::Browse;
     }
 
     /// Validate the form, apply it, and persist.
@@ -1825,6 +1873,92 @@ mod tests {
 
         assert_eq!(app.pending_attach, Some(0), "should resume, not reconnect");
         assert_eq!(app.sessions.len(), 1, "no second session was opened");
+    }
+
+    #[test]
+    fn s_opens_the_session_list_when_sessions_exist() {
+        let mut app = fresh_app("sessionlist", vec![host("web-01", &[])]);
+        let (session, _keepalive) = ssh::LiveSession::for_test("web-01");
+        app.sessions.push(session);
+
+        press(&mut app, KeyCode::Char('s'));
+
+        assert_eq!(app.mode, Mode::SessionList);
+        assert_eq!(app.session_selected, 0);
+    }
+
+    #[test]
+    fn s_reports_nothing_when_there_are_no_sessions() {
+        let mut app = fresh_app("sessionempty", vec![host("web-01", &[])]);
+
+        press(&mut app, KeyCode::Char('s'));
+
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(matches!(&app.status, Status::Error(m) if m.contains("no active sessions")));
+    }
+
+    #[test]
+    fn session_list_navigation_clamps_to_the_list() {
+        let mut app = fresh_app("sessionnav", vec![]);
+        app.sessions.push(ssh::LiveSession::for_test("alpha").0);
+        app.sessions.push(ssh::LiveSession::for_test("beta").0);
+        app.mode = Mode::SessionList;
+
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.session_selected, 1);
+
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.session_selected, 1, "should not run past the end");
+
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.session_selected, 0, "should not underflow");
+    }
+
+    #[test]
+    fn enter_in_session_list_resumes_the_selected_session() {
+        let mut app = fresh_app("sessionresume", vec![]);
+        app.sessions.push(ssh::LiveSession::for_test("alpha").0);
+        app.sessions.push(ssh::LiveSession::for_test("beta").0);
+        app.mode = Mode::SessionList;
+        app.session_selected = 1;
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.pending_attach, Some(1), "should resume beta");
+        assert_eq!(app.mode, Mode::Browse, "returns to the host list");
+        assert!(matches!(&app.status, Status::Busy(m) if m.contains("beta")));
+    }
+
+    #[test]
+    fn esc_leaves_the_session_list_without_resuming() {
+        let mut app = fresh_app("sessionesc", vec![]);
+        app.sessions.push(ssh::LiveSession::for_test("alpha").0);
+        app.mode = Mode::SessionList;
+
+        press(&mut app, KeyCode::Esc);
+
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.pending_attach.is_none());
+    }
+
+    #[test]
+    fn session_selection_is_clamped_when_a_session_dies() {
+        let mut app = fresh_app("sessionprune", vec![]);
+        let (alpha, _keep_alpha) = ssh::LiveSession::for_test("alpha");
+        let (beta, _keep_beta) = ssh::LiveSession::for_test("beta");
+        app.sessions.push(alpha);
+        app.sessions.push(beta);
+        app.session_selected = 1;
+
+        app.sessions[1].mark_ended_for_test();
+        app.prune_dead_sessions();
+
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(
+            app.session_selected, 0,
+            "selection must be clamped after prune"
+        );
     }
 
     /// Adding dozens of hosts to someone's config must not happen on one
