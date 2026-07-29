@@ -74,6 +74,12 @@ puttygen tests/fixtures/ed25519_v3_plain.ppk -O public-openssh \
 cat > /tmp/lv-sshd/Dockerfile <<'EOF'
 FROM alpine:latest
 RUN apk add --no-cache openssh-server && ssh-keygen -A && adduser -D -s /bin/sh tester
+# `adduser -D` leaves the account password-locked (`!` in /etc/shadow) and sshd
+# refuses a locked account even for publickey auth — the log says "User tester
+# not allowed because account is locked" while the client just sees "Permission
+# denied (publickey,...)". `*` means no password rather than locked, which is
+# what a key-only account wants.
+RUN sed -i 's/^tester:!:/tester:*:/' /etc/shadow
 RUN mkdir -p /home/tester/.ssh
 COPY authorized_keys /home/tester/.ssh/authorized_keys
 RUN chown -R tester:tester /home/tester/.ssh && chmod 700 /home/tester/.ssh \
