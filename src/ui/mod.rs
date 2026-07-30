@@ -551,6 +551,11 @@ fn render_secret_prompt(app: &App, theme: &Theme, frame: &mut Frame, area: Rect)
             format!("  {} rejected — try again", request.kind.title()),
             theme.error_style(),
         )
+    } else if let Some(note) = &request.note {
+        // Takes the headline rather than adding a line: the reason the prompt
+        // appeared *is* the answer to "the server wants a password", and a
+        // seventh row would not fit the popup.
+        Span::styled(format!("  {note}"), theme.base())
     } else {
         let what = match request.kind {
             ssh::SecretKind::Passphrase => "this key is encrypted",
@@ -672,6 +677,33 @@ fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
             "  ↵ resume session   esc back to hosts",
             theme.dimmed(),
         )]),
+        // The label stays visible while typing: the whole point of this prompt is
+        // that it takes a different kind of input from the filter, and a bare
+        // caret on the same row would be indistinguishable from one.
+        Mode::QuickConnect => {
+            const LABEL: &str = "  connect to ";
+            const HINT: &str = "   user@host[:port]   esc cancels";
+            /// Columns to keep for typing before the hint is dropped. A syntax
+            /// reminder is worth less than seeing what you have typed.
+            const ROOM_TO_TYPE: usize = 24;
+
+            // `- 2` for the block's borders, as the filter row does.
+            let inner = (area.width as usize).saturating_sub(2);
+            // Everything after the caret has to be paid for too. Counting only
+            // the label pushed the caret off the row at 80 columns.
+            let hint = inner >= LABEL.len() + HINT.len() + ROOM_TO_TYPE;
+            let room = inner.saturating_sub(LABEL.len() + 1 + if hint { HINT.len() } else { 0 });
+
+            let mut spans = vec![
+                Span::styled(LABEL, theme.key_hint()),
+                Span::styled(visible_tail(&app.quick_input, room), theme.base()),
+                Span::styled("▌", theme.key_hint()),
+            ];
+            if hint {
+                spans.push(Span::styled(HINT, theme.dimmed()));
+            }
+            Line::from(spans)
+        }
         _ if !app.filter.is_empty() => Line::from(vec![
             Span::styled("  filter: ", theme.dimmed()),
             Span::styled(app.filter.clone(), theme.base()),
@@ -828,11 +860,15 @@ fn render_scrollbar(theme: &Theme, frame: &mut Frame, track: Rect, total: usize,
 /// computed. All the cap added was a second copy of the other columns'
 /// minimums, waiting to drift out of step with them.
 fn name_column_width(longest_name: usize) -> u16 {
-    /// The `● ` / `  ` session marker each name is rendered behind.
-    const MARKER: usize = 2;
-    /// `"  name"`. Verified by rendering: one-character names without this
-    /// floor shrink the column to three and clip the header to `n`.
-    const FLOOR: u16 = 6;
+    /// The `●2 ` / `●  ` / `   ` session marker each name is rendered behind.
+    /// Three columns, not two: a host may hold several sessions and the count
+    /// sits in the marker, so every row has to leave room for it or the names
+    /// stop lining up the moment a second session opens.
+    const MARKER: usize = 3;
+    /// `"   name"` — the header, which is indented to match the marker. Verified
+    /// by rendering: one-character names without this floor shrink the column and
+    /// clip the header to `n`.
+    const FLOOR: u16 = 7;
 
     u16::try_from(longest_name.saturating_add(MARKER))
         .unwrap_or(u16::MAX)
@@ -937,10 +973,18 @@ fn render_hosts(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
                 theme.base()
             };
             // A live session is the difference between ↵ connecting and ↵
-            // resuming, so it has to be visible in the list.
-            let name = match app.session_for(&host.name) {
-                Some(_) => format!("● {}", host.name),
-                None => format!("  {}", host.name),
+            // resuming, so it has to be visible in the list. The count matters
+            // just as much once a host can hold several: `↵` resumes the first
+            // of them, and without the number nothing says the rest are there
+            // or that `s` is how to reach them.
+            let name = match app.session_count(&host.name) {
+                0 => format!("   {}", host.name),
+                1 => format!("●  {}", host.name),
+                // Past nine the digit would widen the column for every row, to
+                // describe a case that does not happen. `+` says "more" in the
+                // same cell.
+                n if n <= 9 => format!("●{n} {}", host.name),
+                _ => format!("●+ {}", host.name),
             };
             Row::new(vec![
                 name,
@@ -990,7 +1034,7 @@ fn render_hosts(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     ];
 
     let table = Table::new(rows, widths)
-        .header(Row::new(vec!["  name", "destination", "auth", "tags"]).style(theme.dimmed()))
+        .header(Row::new(vec!["   name", "destination", "auth", "tags"]).style(theme.dimmed()))
         .block(block);
 
     frame.render_widget(table, area);
@@ -1252,11 +1296,117 @@ mod tests {
                 prompt: kind.title().into(),
                 echo,
                 retry,
+                note: None,
             },
             reply,
         ));
         app.secret_input = zeroize::Zeroizing::new(typed.into());
         answer
+    }
+
+    /// A wide terminal keeps the syntax reminder; a narrow one spends those
+    /// columns on the target instead.
+    #[test]
+    fn the_quick_connect_hint_yields_to_the_target_when_space_is_tight() {
+        let mut app = app_with(vec![]);
+        app.mode = Mode::QuickConnect;
+        app.quick_input = "deploy@10.0.0.1".into();
+
+        let wide = draw(&app, 120, 20);
+        assert!(
+            wide.contains("esc cancels"),
+            "dropped the hint with room to spare:\n{wide}"
+        );
+
+        let narrow = draw(&app, 50, 20);
+        assert!(
+            !narrow.contains("esc cancels"),
+            "kept the hint at 50 columns:\n{narrow}"
+        );
+        assert!(narrow.contains("10.0.0.1"), "lost the target:\n{narrow}");
+    }
+
+    /// The caret has to survive a target longer than the line. It marks where you
+    /// are typing, and the budget for the input has to account for the hint after
+    /// it as well as the label before — not just the label.
+    #[test]
+    fn a_long_quick_connect_target_keeps_its_caret_on_screen() {
+        for width in [120u16, 100, 80, 60] {
+            let mut app = app_with(vec![]);
+            app.mode = Mode::QuickConnect;
+            app.quick_input =
+                "deploy@some.very.long.hostname.inside.a.corporate.domain.example.net:2222".into();
+
+            let out = draw(&app, width, 20);
+            let header = out
+                .lines()
+                .find(|l| l.contains("connect to"))
+                .unwrap_or("<no header>")
+                .to_string();
+            assert!(
+                header.contains('▌'),
+                "at width {width} the caret fell off:\n{header}"
+            );
+            // The end is what matters: that is where the caret is.
+            assert!(
+                header.contains(":2222"),
+                "at width {width} the end of the target is not shown:\n{header}"
+            );
+        }
+    }
+
+    /// When authentication falls back from the agent, the prompt has to say why.
+    /// This began life as a status line, which the prompt overwrote in the same
+    /// frame — so the test asserts on the rendered cells, where the user is.
+    #[test]
+    fn a_fallback_password_prompt_says_why_it_appeared() {
+        use crate::app::PendingSecret;
+
+        let mut app = app_with(vec![]);
+        let (reply, _answer) = tokio::sync::oneshot::channel();
+        app.mode = Mode::Secret;
+        app.secret_prompt = Some(PendingSecret::for_test(
+            ssh::SecretRequest {
+                kind: ssh::SecretKind::Password,
+                subject: "deploy@10.0.0.1".into(),
+                prompt: "password".into(),
+                echo: false,
+                retry: false,
+                // The real message, so the width is tested and not just the wiring.
+                note: Some(ssh::AGENT_FELL_BACK.into()),
+            },
+            reply,
+        ));
+
+        let out = draw(&app, 100, 24);
+        assert!(
+            out.contains("keys were not accepted"),
+            "the reason is not on screen:\n{out}"
+        );
+        // In full: the popup is 66 wide, so a longer note is silently clipped and
+        // the user reads half a sentence.
+        assert!(
+            out.contains("the agent's keys were not accepted"),
+            "the note is truncated:\n{out}"
+        );
+        // The note replaces the generic line rather than joining it.
+        assert!(
+            !out.contains("the server wants a password"),
+            "both headlines rendered:\n{out}"
+        );
+    }
+
+    /// Without a note, nothing changes: the generic explanation still shows.
+    #[test]
+    fn an_ordinary_password_prompt_keeps_its_own_headline() {
+        let mut app = app_with(vec![]);
+        let _answer = arm(&mut app, ssh::SecretKind::Password, false, false, "");
+
+        let out = draw(&app, 100, 24);
+        assert!(
+            out.contains("the server wants a password"),
+            "lost the default headline:\n{out}"
+        );
     }
 
     /// `^O` must be advertised where it is usable. The placeholder hint vanishes
@@ -1613,13 +1763,14 @@ mod tests {
         );
     }
 
-    /// The header is `"  name"`, and a column narrower than that clips it —
-    /// confirmed by rendering one-character names, which produced `n`.
+    /// The header is `"   name"` — three columns of marker plus the word — and a
+    /// column narrower than that clips it; confirmed by rendering one-character
+    /// names, which produced `n`.
     #[test]
     fn the_name_column_never_clips_its_own_header() {
         for longest in [0usize, 1, 2, 3, 4, usize::MAX] {
             let w = name_column_width(longest);
-            assert!(w >= 6, "width {w} for a longest name of {longest}");
+            assert!(w >= 7, "width {w} for a longest name of {longest}");
         }
     }
 
@@ -1959,6 +2110,78 @@ mod tests {
         assert!(out.contains("alpha"), "first session shown:\n{out}");
         assert!(out.contains("beta"), "second session shown:\n{out}");
         assert!(out.contains("detached"), "state shown:\n{out}");
+    }
+
+    /// `↵` resumes the first session on a host, so the host list has to say when
+    /// there are others — otherwise they are invisible and only `s` finds them.
+    #[test]
+    fn the_host_list_counts_several_sessions_on_one_host() {
+        let mut app = app_with(vec![host("web-01"), host("db-primary")]);
+        // The receivers stay bound. Dropping one closes the command channel, and
+        // `has_ended` — which `session_count` filters on — reads that as gone.
+        let (one, _r1) = ssh::LiveSession::for_test("web-01");
+        let (two, _r2) = ssh::LiveSession::for_test("web-01");
+        let (three, _r3) = ssh::LiveSession::for_test("db-primary");
+        app.sessions.push(one);
+        app.sessions.push(two);
+        app.sessions.push(three);
+
+        let out = draw(&app, 100, 24);
+        assert!(out.contains("●2 web-01"), "no count on web-01:\n{out}");
+        // One session stays a bare marker; `●1` would be noise on the common case.
+        assert!(
+            out.contains("●  db-primary"),
+            "db-primary should not be numbered:\n{out}"
+        );
+    }
+
+    /// Past nine the count becomes `+`: a second digit would widen the column for
+    /// every row, to describe something that does not happen.
+    #[test]
+    fn more_than_nine_sessions_on_a_host_show_a_plus() {
+        let mut app = app_with(vec![host("web-01")]);
+        let mut keep = Vec::new();
+        for _ in 0..10 {
+            let (session, receiver) = ssh::LiveSession::for_test("web-01");
+            app.sessions.push(session);
+            keep.push(receiver);
+        }
+
+        let out = draw(&app, 100, 24);
+        assert!(out.contains("●+ web-01"), "no overflow marker:\n{out}");
+    }
+
+    /// The marker occupies three columns whether or not it holds a digit, or the
+    /// names stop lining up the moment a second session opens.
+    #[test]
+    fn the_session_marker_keeps_the_names_aligned() {
+        let mut app = app_with(vec![host("web-01"), host("db-primary")]);
+        let (one, _r1) = ssh::LiveSession::for_test("web-01");
+        let (two, _r2) = ssh::LiveSession::for_test("web-01");
+        app.sessions.push(one);
+        app.sessions.push(two);
+
+        let out = draw(&app, 100, 24);
+        // Columns, not bytes. `find` gives a byte offset, and `●` is three bytes
+        // to a space's one — comparing those makes an aligned row look shifted.
+        let column = |needle: &str| {
+            out.lines().find(|l| l.contains(needle)).map(|l| {
+                let byte = l.find(needle).unwrap();
+                l[..byte].chars().count()
+            })
+        };
+        assert_eq!(
+            column("web-01"),
+            column("db-primary"),
+            "names are in different columns:\n{out}"
+        );
+        // And the header sits above them. Widening the marker without widening
+        // the header left `name` one column to the left of every value.
+        assert_eq!(
+            column("name"),
+            column("web-01"),
+            "the header does not line up with the names:\n{out}"
+        );
     }
 
     /// Two sessions on one host have to be told apart, and a lone session must

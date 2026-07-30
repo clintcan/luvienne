@@ -71,9 +71,15 @@ Both are real frames rendered by the app, with invented hosts.
   offered for resume, and one that dies while detached says so rather than
   disappearing. `s` lists what is detached once you have more than a couple to
   keep track of, and `n` opens another shell on a host that already has one.
+- **Quick connect** with `c` for somewhere that is not in the list — type
+  `user@host:port` the way you would after `ssh`. It uses the agent, asks for a
+  username if you leave one out, and is not written to the inventory. Type a name
+  you *have* saved and it connects with that entry's settings instead, jump host
+  and all; add a user or a port (`root@web-01`) to reach the literal address.
 - **Four ways to authenticate**: SSH agent, private key files (OpenSSH, PEM and
   PuTTY `.ppk` v2/v3), passwords, and keyboard-interactive — including servers
-  that demand more than one of them.
+  that demand more than one of them. When the agent holds nothing a server will
+  accept, it asks instead of giving up, the way `ssh` does.
 - **Jump hosts** are a real tunnel, not a second login. The bastion moves bytes
   it cannot read and never sees the target's credentials.
 - **Port forwarding**, `-L` and `-R`, attached to the host so you configure it
@@ -179,6 +185,7 @@ See [`hosts.example.toml`](hosts.example.toml) for every field, commented.
 | --- | --- |
 | `↵` | connect, or resume a detached session |
 | `Ctrl-]` | detach, leaving the remote shell running |
+| `c` | quick connect to `user@host[:port]`, without saving it |
 | `n` | open another session to the selected host |
 | `s` | list detached sessions; `↵` resumes one, `esc` goes back |
 | `/` | filter; `esc` clears it |
@@ -223,8 +230,11 @@ Working and used daily against real servers, but young, and a personal project
 rather than a supported product. Not on crates.io.
 
 Known gaps: no SOCKS (`ssh -D`), no file transfer, no agent forwarding.
-Multi-prompt 2FA is implemented but has never been exercised against a server
-that actually asks twice. Developed on macOS and verified on Linux (arm64
+Two-factor auth is exercised against a real server that accepts a key and then
+demands a second factor (`AuthenticationMethods publickey,keyboard-interactive`);
+see [`TESTING.md`](TESTING.md). Several prompts inside a *single*
+keyboard-interactive round — a TOTP module asking for a password and a code
+together — is implemented but still untested. Developed on macOS and verified on Linux (arm64
 Ubuntu) as far as building, the whole test suite, and a real session including
 detach and resume. tmux is still unknown territory.
 

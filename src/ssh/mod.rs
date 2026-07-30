@@ -102,6 +102,13 @@ pub struct SecretRequest {
     /// Set when the previous attempt was rejected, so the UI can say so rather
     /// than silently re-prompting.
     pub retry: bool,
+    /// Why this prompt appeared, when that is not obvious from the prompt alone.
+    ///
+    /// Set when authentication fell back from the agent: without it the user
+    /// configured `auth = agent`, or typed a bare address into quick connect, and
+    /// is suddenly asked for a password with no explanation. A status line cannot
+    /// carry this — the prompt replaces it in the same frame.
+    pub note: Option<String>,
 }
 
 /// Connection errors.
@@ -477,6 +484,7 @@ async fn resolve_user(host: &Host, tx: &UnboundedSender<SshEvent>) -> Result<Str
             // A username is not a secret, and typing one blind is miserable.
             echo: true,
             retry: false,
+            note: None,
         },
     )
     .await?;
@@ -504,12 +512,23 @@ async fn authenticate(
     // The host entry names the *first* method. Anything the server demands
     // after that is chosen from what it says it still wants.
     let mut outcome = match &host.auth {
-        AuthRef::Agent => authenticate_with_agent(handle, user, &host.address).await?,
+        AuthRef::Agent => {
+            fall_back_to_interactive(
+                authenticate_with_agent(handle, user, &host.address).await,
+                handle,
+                user,
+                &host.address,
+                tx,
+            )
+            .await?
+        }
         AuthRef::Key { path } => {
             let key = load_key_interactive(path, host.cache_passphrase, tx).await?;
             authenticate_with_key(handle, user, &host.address, key).await?
         }
-        AuthRef::Password => authenticate_with_password(handle, user, &host.address, tx).await?,
+        AuthRef::Password => {
+            authenticate_with_password(handle, user, &host.address, tx, None).await?
+        }
     };
 
     for _ in 0..MAX_AUTH_METHODS {
@@ -521,9 +540,9 @@ async fn authenticate(
         // Prefer an interactive method: the key has just been used, and asking
         // for it again would only loop.
         outcome = if remaining.contains(&MethodKind::KeyboardInteractive) {
-            authenticate_keyboard_interactive(handle, user, &host.address, tx).await?
+            authenticate_keyboard_interactive(handle, user, &host.address, tx, None).await?
         } else if remaining.contains(&MethodKind::Password) {
-            authenticate_with_password(handle, user, &host.address, tx).await?
+            authenticate_with_password(handle, user, &host.address, tx, None).await?
         } else {
             return Err(SshError::AuthFailed {
                 user: user.to_string(),
@@ -539,6 +558,57 @@ async fn authenticate(
         method: "multi-factor",
     })
 }
+
+/// Turn a dead end in agent authentication into a prompt, when the server will
+/// take one.
+///
+/// `ssh(1)` walks publickey → keyboard-interactive → password, and stopping at
+/// the first is what made quick connect unusable against a password-only server:
+/// you type an address, the agent holds nothing the server wants, and there is
+/// no way to say "ask me instead". A configured `auth = agent` host gets the same
+/// courtesy — a prompt is strictly more useful than an error, and the server
+/// still decides what it will accept.
+///
+/// Only a failure to *authenticate* falls through. Anything else — a cancelled
+/// prompt, a dropped connection, a protocol error — is returned untouched,
+/// because re-asking would paper over the real problem. And if the server offers
+/// nothing interactive, the original agent error is what the user needs to read,
+/// not a complaint about the fallback.
+async fn fall_back_to_interactive(
+    outcome: Result<Step, SshError>,
+    handle: &mut Handle<Client>,
+    user: &str,
+    host: &str,
+    tx: &UnboundedSender<SshEvent>,
+) -> Result<Step, SshError> {
+    let original = match outcome {
+        Ok(step) => return Ok(step),
+        Err(err @ (SshError::NoAgent | SshError::AuthFailed { .. })) => err,
+        Err(other) => return Err(other),
+    };
+
+    // Carried into the prompt itself rather than the status line, which the
+    // prompt replaces in the same frame.
+    let note = match &original {
+        SshError::NoAgent => NO_AGENT_FELL_BACK,
+        _ => AGENT_FELL_BACK,
+    };
+
+    match authenticate_with_password(handle, user, host, tx, Some(note)).await {
+        Ok(step) => Ok(step),
+        // The server wants neither: say why the *agent* failed, which is the
+        // part the user can act on.
+        Err(SshError::NoInteractiveAuth { .. }) => Err(original),
+        Err(other) => Err(other),
+    }
+}
+
+/// Why a password prompt appeared when the host asked for the agent.
+///
+/// Both are kept under the 62 columns a 66-wide prompt can show: a note that is
+/// clipped mid-sentence is worse than no note, and the wording is the whole point.
+pub const AGENT_FELL_BACK: &str = "the agent's keys were not accepted — asking instead";
+pub const NO_AGENT_FELL_BACK: &str = "no SSH agent, so the server is asking instead";
 
 /// How many authentication methods one hop may chain before we call it a loop.
 const MAX_AUTH_METHODS: usize = 4;
@@ -697,6 +767,7 @@ async fn load_key_interactive(
                 prompt: "passphrase".into(),
                 echo: false,
                 retry: attempt > 0,
+                note: None,
             },
         )
         .await?;
@@ -773,6 +844,7 @@ async fn authenticate_with_password(
     user: &str,
     host: &str,
     tx: &UnboundedSender<SshEvent>,
+    note: Option<&str>,
 ) -> Result<Step, SshError> {
     let subject = format!("{user}@{host}");
 
@@ -792,7 +864,7 @@ async fn authenticate_with_password(
 
     if !methods.contains(&MethodKind::Password) {
         return if methods.contains(&MethodKind::KeyboardInteractive) {
-            authenticate_keyboard_interactive(handle, user, host, tx).await
+            authenticate_keyboard_interactive(handle, user, host, tx, note).await
         } else {
             // Prompting would be pointless: the server will not accept anything
             // we could type. Say so rather than asking for a password it has
@@ -812,6 +884,11 @@ async fn authenticate_with_password(
                 prompt: "password".into(),
                 echo: false,
                 retry: attempt > 0,
+                note: if attempt == 0 {
+                    note.map(str::to_string)
+                } else {
+                    None
+                },
             },
         )
         .await?;
@@ -835,7 +912,7 @@ async fn authenticate_with_password(
                 if !remaining_methods.contains(&MethodKind::Password)
                     && remaining_methods.contains(&MethodKind::KeyboardInteractive)
                 {
-                    return authenticate_keyboard_interactive(handle, user, host, tx).await;
+                    return authenticate_keyboard_interactive(handle, user, host, tx, note).await;
                 }
             }
         }
@@ -858,7 +935,11 @@ async fn authenticate_keyboard_interactive(
     user: &str,
     host: &str,
     tx: &UnboundedSender<SshEvent>,
+    note: Option<&str>,
 ) -> Result<Step, SshError> {
+    // Shown once. Repeating it above every round of a multi-prompt 2FA exchange
+    // would turn an explanation into noise.
+    let mut note = note;
     let subject = format!("{user}@{host}");
     let mut response = handle
         .authenticate_keyboard_interactive_start(user, None)
@@ -883,6 +964,7 @@ async fn authenticate_keyboard_interactive(
                             prompt: prompt.prompt.trim().trim_end_matches(':').to_string(),
                             echo: prompt.echo,
                             retry: false,
+                            note: note.take().map(str::to_string),
                         },
                     )
                     .await?;
@@ -1217,7 +1299,7 @@ fn split_at_detach(bytes: &[u8]) -> Option<&[u8]> {
 /// Do not parse the byte stream, beyond looking for [`DETACH_KEY`]. Anything
 /// more is the first step toward writing a terminal emulator, which is out of
 /// scope.
-pub async fn attach(session: &LiveSession) -> Result<SessionOutcome, SshError> {
+pub async fn attach(session: &LiveSession, switching: bool) -> Result<SessionOutcome, SshError> {
     let (sink, mut output) = tokio::sync::mpsc::unbounded_channel();
     if !session.attach_output(sink) {
         // The task is gone, so the session ended while it was detached.
@@ -1226,6 +1308,17 @@ pub async fn attach(session: &LiveSession) -> Result<SessionOutcome, SshError> {
 
     let resuming = !session.take_first_attach();
     let mut stdout = tokio::io::stdout();
+
+    // Sessions share the primary screen, so the text the *previous* one wrote is
+    // still on it. Landing in a shell showing another host's output is worse than
+    // confusing — you cannot tell which machine you are typing at.
+    //
+    // Only when switching. The backlog is drained on attach, so it holds just
+    // what arrived while detached: clearing on a plain re-attach of an idle
+    // session would leave a blank screen with nothing to replay onto it.
+    if switching {
+        write_session_output(&mut stdout, b"\x1b[2J\x1b[H").await?;
+    }
 
     if resuming {
         // Put the terminal back in the buffer the remote thinks it is using.

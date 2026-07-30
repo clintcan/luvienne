@@ -63,6 +63,23 @@ pub enum ChainError {
     TooDeep,
 }
 
+/// Why an `ssh`-style target could not be read. Every message is shown on the
+/// status line, so each says what to type instead rather than only what is wrong.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TargetError {
+    #[error("type a host, as in user@10.0.0.1 or db.internal:2222")]
+    Empty,
+
+    #[error("{0:?} has no host in it — try user@10.0.0.1")]
+    NoHost(String),
+
+    #[error("{0:?} is missing the closing bracket, as in [::1]:22")]
+    Unclosed(String),
+
+    #[error("{0:?} is not a port from 1 to 65535")]
+    Port(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Host {
     /// Display name, and the key used by `jump` references.
@@ -99,6 +116,81 @@ pub struct Host {
 }
 
 impl Host {
+    /// Build a throwaway host from an `ssh`-style target: `[user@]host[:port]`.
+    ///
+    /// The inverse of [`Self::destination`], for quick connect — somewhere to
+    /// reach once without adding it to the inventory. Auth is the agent, which
+    /// is what a host with no `auth` line already means, and an omitted user is
+    /// left empty so the existing "login as" prompt asks at connect time rather
+    /// than this guessing.
+    ///
+    /// `name` is the target as typed, so the session list and every status line
+    /// call it what the user called it.
+    pub fn from_target(target: &str) -> Result<Self, TargetError> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Err(TargetError::Empty);
+        }
+
+        let (user, rest) = match target.rsplit_once('@') {
+            Some((user, rest)) => (user.trim().to_string(), rest.trim()),
+            None => (String::new(), target),
+        };
+
+        // An IPv6 literal has to be bracketed to be told apart from the port
+        // separator, the same rule `ssh` and every URL follow.
+        let (address, port) = if let Some(stripped) = rest.strip_prefix('[') {
+            let (inside, after) = stripped
+                .split_once(']')
+                .ok_or_else(|| TargetError::Unclosed(target.to_string()))?;
+            // Only `:port` may follow the bracket. Taking `strip_prefix` at face
+            // value here silently discarded anything else and connected to the
+            // default port, so `[::1]2222` reached 22.
+            let port = match after {
+                "" => None,
+                other => Some(
+                    other
+                        .strip_prefix(':')
+                        .ok_or_else(|| TargetError::Port(other.to_string()))?,
+                ),
+            };
+            (inside.trim().to_string(), port)
+        } else {
+            match rest.split_once(':') {
+                // Trimmed: `host : 22` otherwise yields an address with a
+                // trailing space, which fails to resolve and blames the network.
+                Some((host, port)) => (host.trim().to_string(), Some(port)),
+                None => (rest.to_string(), None),
+            }
+        };
+
+        if address.is_empty() {
+            return Err(TargetError::NoHost(target.to_string()));
+        }
+
+        let port = match port {
+            None | Some("") => default_port(),
+            Some(text) => match text.trim().parse() {
+                // `u16` happily parses 0, and the error above promises 1 to
+                // 65535 — a client connect to port 0 is meaningless anyway.
+                Ok(0) | Err(_) => return Err(TargetError::Port(text.trim().to_string())),
+                Ok(port) => port,
+            },
+        };
+
+        Ok(Self {
+            name: target.to_string(),
+            address,
+            port,
+            user,
+            tags: Vec::new(),
+            auth: AuthRef::Agent,
+            jump: None,
+            cache_passphrase: false,
+            forwards: Vec::new(),
+        })
+    }
+
     pub fn destination(&self) -> String {
         // An empty user means the username is asked for at connect time, so
         // show that rather than a bare `@host` that looks like a bug.
@@ -453,6 +545,132 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shapes people actually type at an `ssh` prompt.
+    #[test]
+    fn a_target_reads_the_same_way_ssh_would() {
+        let plain = Host::from_target("db.internal").unwrap();
+        assert_eq!(
+            (plain.user.as_str(), plain.address.as_str(), plain.port),
+            ("", "db.internal", 22)
+        );
+
+        let with_user = Host::from_target("deploy@10.0.0.5").unwrap();
+        assert_eq!(
+            (
+                with_user.user.as_str(),
+                with_user.address.as_str(),
+                with_user.port
+            ),
+            ("deploy", "10.0.0.5", 22)
+        );
+
+        let with_port = Host::from_target("deploy@10.0.0.5:2222").unwrap();
+        assert_eq!(with_port.port, 2222);
+
+        // Bracketed, or the last colon of an IPv6 address reads as the port.
+        let v6 = Host::from_target("[2001:db8::1]:2222").unwrap();
+        assert_eq!((v6.address.as_str(), v6.port), ("2001:db8::1", 2222));
+
+        let v6_default = Host::from_target("root@[::1]").unwrap();
+        assert_eq!(
+            (
+                v6_default.user.as_str(),
+                v6_default.address.as_str(),
+                v6_default.port
+            ),
+            ("root", "::1", 22)
+        );
+    }
+
+    /// An omitted user is left empty rather than guessed, which routes into the
+    /// same "login as" prompt an `(ask)` host uses.
+    #[test]
+    fn a_target_without_a_user_asks_rather_than_assuming() {
+        let host = Host::from_target("10.0.0.9").unwrap();
+        assert!(host.user.is_empty());
+        assert!(host.destination().contains("(ask)"));
+    }
+
+    /// Quick connect is somewhere to reach once: the agent, nothing cached, and
+    /// no jump host. It must not inherit anything from the inventory.
+    #[test]
+    fn a_target_is_a_bare_agent_host() {
+        let host = Host::from_target("deploy@10.0.0.5").unwrap();
+        assert!(matches!(host.auth, AuthRef::Agent));
+        assert!(host.jump.is_none());
+        assert!(!host.cache_passphrase);
+        assert!(host.tags.is_empty());
+        assert!(host.forwards.is_empty());
+        // Named as typed, so the session list calls it what the user called it.
+        assert_eq!(host.name, "deploy@10.0.0.5");
+    }
+
+    /// Shapes that are odd but not wrong, pinned so a later tidy-up does not
+    /// change them by accident.
+    #[test]
+    fn the_awkward_target_shapes_are_pinned() {
+        // A bracketed address with no port at all.
+        let bare = Host::from_target("[fe80::1]").unwrap();
+        assert_eq!((bare.address.as_str(), bare.port), ("fe80::1", 22));
+
+        // A trailing colon is "no port given", not port zero.
+        assert_eq!(Host::from_target("host:").unwrap().port, 22);
+
+        // Two colons outside brackets is a typo, not host:22 with extra.
+        assert!(matches!(
+            Host::from_target("host:22:33"),
+            Err(TargetError::Port(_))
+        ));
+
+        // Surrounding and internal whitespace around the separators is trimmed.
+        let spaced = Host::from_target("  deploy @ 10.0.0.1 : 2222  ").unwrap();
+        assert_eq!(
+            (spaced.user.as_str(), spaced.address.as_str(), spaced.port),
+            ("deploy", "10.0.0.1", 2222)
+        );
+
+        // A user with no host is caught; a host with no user is the ask path.
+        assert!(matches!(
+            Host::from_target("@"),
+            Err(TargetError::NoHost(_))
+        ));
+        assert!(Host::from_target("@host").unwrap().user.is_empty());
+    }
+
+    #[test]
+    fn bad_targets_say_what_to_type_instead() {
+        // `matches!` rather than `assert_eq!`: `Host` has no `PartialEq`, and
+        // giving it one just to compare the error side would be the wrong fix.
+        assert!(matches!(Host::from_target("   "), Err(TargetError::Empty)));
+        assert!(matches!(
+            Host::from_target("deploy@"),
+            Err(TargetError::NoHost(_))
+        ));
+        assert!(matches!(
+            Host::from_target("[::1:22"),
+            Err(TargetError::Unclosed(_))
+        ));
+        assert!(matches!(
+            Host::from_target("host:not-a-port"),
+            Err(TargetError::Port(_))
+        ));
+        assert!(matches!(
+            Host::from_target("host:70000"),
+            Err(TargetError::Port(_))
+        ));
+        // `u16` parses this happily; the error text promises 1 to 65535.
+        assert!(matches!(
+            Host::from_target("host:0"),
+            Err(TargetError::Port(_))
+        ));
+        // Anything after the bracket that is not `:port` is a typo, not something
+        // to discard silently and connect anyway.
+        assert!(
+            Host::from_target("[::1]junk").is_err(),
+            "accepted junk after a bracketed address"
+        );
+    }
 
     fn host(name: &str, tags: &[&str]) -> Host {
         Host {

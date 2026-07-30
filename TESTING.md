@@ -3,15 +3,23 @@
 ## Automated
 
 ```sh
-cargo test                          # 244 on macOS, 239 on Linux, + 1 ignored, ~3s (mostly Argon2 in the PPK fixtures)
+cargo test                          # unit + 9 CLI; five fewer unit on Linux (the macOS-gated Keychain ones), + 1 ignored, ~3s (mostly Argon2 in the PPK fixtures)
 cargo clippy --all-targets -- -D warnings
 ```
 
 Rendering is asserted against ratatui's `TestBackend` buffer, so the UI is covered
-without a terminal. Tests that save an inventory write to a temp path — the suite
-must never be able to reach the real `hosts.toml`, so `App` takes its path
-explicitly rather than deriving it. Key loading is covered against real `puttygen` / `ssh-keygen`
-output in `tests/fixtures/`.
+without a terminal. Prefer it over the pty driver for anything positional: the
+driver strips cursor moves, so its transcript has no line structure and column
+comparisons made against it are meaningless.
+
+Tests that save an inventory write to a temp path — the suite must never be able
+to reach the real `hosts.toml`, so `App` takes its path explicitly rather than
+deriving it. Key loading is covered against real `puttygen` / `ssh-keygen` output
+in `tests/fixtures/`.
+
+`tests/cli.rs` drives the built binary for the command-line surface — the flags,
+the host argument, and the no-terminal path — against a throwaway
+`XDG_CONFIG_HOME`, never the developer's own inventory.
 
 One test is `#[ignore]`d: the Keychain round trip writes to the developer's own
 login keychain and can raise an access dialog, so it would hang CI.
@@ -152,6 +160,64 @@ docker run -d --name luvienne-pam -p 2222:22 luvienne-pam \
 With `PasswordAuthentication=no`, the client's method probe should send it
 straight to keyboard-interactive — you should be asked for a secret exactly
 once, with the server's own `Password` label rather than wording of ours.
+
+### Testing two factors
+
+The path worth exercising deliberately is a server that accepts one factor and
+then demands another — `Step::More` in `ssh/mod.rs`, and the loop around it. A
+hardened sshd does this with `AuthenticationMethods`, and it is the case where
+treating partial success as failure used to report "the server rejected the key"
+about a key the server had just accepted.
+
+```sh
+mkdir -p /tmp/lv-2fa
+puttygen tests/fixtures/ed25519_v3_plain.ppk -O public-openssh \
+  -o /tmp/lv-2fa/authorized_keys
+
+cat > /tmp/lv-2fa/Dockerfile <<'EOF'
+FROM alpine:latest
+RUN apk add --no-cache openssh-server-pam linux-pam && ssh-keygen -A \
+ && adduser -D -s /bin/sh tester
+RUN sed -i 's/^tester:!:/tester:*:/' /etc/shadow && echo 'tester:hunter2' | chpasswd
+RUN mkdir -p /home/tester/.ssh
+COPY authorized_keys /home/tester/.ssh/authorized_keys
+RUN chown -R tester:tester /home/tester/.ssh && chmod 700 /home/tester/.ssh \
+ && chmod 600 /home/tester/.ssh/authorized_keys
+EXPOSE 22
+CMD ["/usr/sbin/sshd.pam","-D","-e","-o","UsePAM=yes", \
+     "-o","AuthenticationMethods=publickey,keyboard-interactive", \
+     "-o","KbdInteractiveAuthentication=yes","-o","PasswordAuthentication=no"]
+EOF
+
+docker build -t luvienne-2fa /tmp/lv-2fa
+docker run -d --name luvienne-2fa -p 2224:22 luvienne-2fa
+```
+
+Confirm the *server* does what you think before driving the app — this is the
+whole point of the two-factor case, and it is easy to build a container that
+quietly only asks once:
+
+```sh
+puttygen tests/fixtures/ed25519_v3_plain.ppk -O private-openssh -o /tmp/lv_2fa_key
+chmod 600 /tmp/lv_2fa_key
+ssh -v -i /tmp/lv_2fa_key -p 2224 -o PreferredAuthentications=publickey \
+    -o BatchMode=yes tester@127.0.0.1 true 2>&1 | grep -i "partial success"
+```
+
+You want `Authenticated using "publickey" with partial success.` Then point a
+host at port 2224 with `auth = { method = "key", path = … }` and connect. The key
+goes first, then you are asked once more — with the server's own `Password:`
+label, and the password is `hunter2`.
+
+Not covered by this fixture: **several prompts inside one keyboard-interactive
+round**, as a TOTP module asking for a password and a verification code together
+would produce. That needs a PAM module that issues more than one prompt in a
+single conversation — `libpam-google-authenticator` on a Debian base rather than
+Alpine is the usual way — and it remains untested.
+
+```sh
+docker rm -f luvienne-2fa && docker rmi luvienne-2fa
+```
 
 ### 3. Run it
 

@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use russh::client::Handle;
 use russh::{Channel, ChannelMsg, client};
@@ -23,6 +23,13 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 /// bound — so a chatty session loses its middle rather than its end. The tail is
 /// what you want on return.
 const BACKLOG_LIMIT: usize = 256 * 1024;
+
+/// Handed out to distinguish one session from another.
+///
+/// Position in `App::sessions` cannot do it: rows shift as sessions end, and the
+/// caller needs to know whether the session it is attaching to is the one it
+/// attached to last — the answer decides whether the screen is cleared.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Why [`crate::ssh::attach`] returned.
 #[derive(Debug, PartialEq, Eq)]
@@ -140,6 +147,8 @@ impl Drop for AbortOnDrop {
 /// exactly one; dropping it does *not* close the session, so a handle must be
 /// closed explicitly or deliberately leaked at exit.
 pub struct LiveSession {
+    /// Unique for the life of the process. See [`NEXT_ID`].
+    id: u64,
     pub host: String,
     commands: UnboundedSender<Command>,
     ended: Arc<AtomicBool>,
@@ -187,6 +196,7 @@ impl LiveSession {
             forwards.running,
         ));
         Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             host,
             commands,
             ended,
@@ -194,6 +204,11 @@ impl LiveSession {
             first_attach: Arc::new(AtomicBool::new(true)),
             forward_failures,
         }
+    }
+
+    /// Identity, stable while the session lives.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Forwards that could not be raised. Empty when everything came up.
@@ -261,6 +276,7 @@ impl LiveSession {
         let (commands, receiver) = unbounded_channel();
         (
             Self {
+                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 host: host.into(),
                 commands,
                 ended: Arc::new(AtomicBool::new(false)),

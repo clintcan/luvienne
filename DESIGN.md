@@ -78,6 +78,37 @@ we restore the alternate screen and return to the host list.
 **A session outlives any one attach.** `Ctrl-]` detaches back to the host list
 leaving the remote shell running; the list marks it `●` and `↵` resumes it.
 
+**Agent authentication falls through to a prompt.** `ssh(1)` walks publickey →
+keyboard-interactive → password, and stopping at the first left quick connect
+unusable against a password-only server: you type an address, the agent holds
+nothing the server wants, and there is no way to say "ask me instead". A
+configured `auth = agent` host gets the same treatment — a prompt beats an error,
+and the server still decides what it accepts. Only `NoAgent` and `AuthFailed`
+fall through; a cancelled prompt or a dropped connection is returned untouched,
+and if the server offers nothing interactive the original agent error is what
+surfaces, because that is the part the user can act on.
+
+**Quick connect (`c`) builds a throwaway host, not an inventory entry.**
+`Host::from_target` parses `[user@]host[:port]` — the inverse of `destination()` —
+and hands `dial_chain` a one-hop chain, bypassing `connection_chain` because the
+target has never been in the inventory for it to resolve. Three defaults, each
+chosen to avoid inventing anything: the agent, because that is already what a host
+with no `auth` line means; an empty user, so the existing "login as" prompt asks
+rather than this guessing; and no jump host, since somewhere you are reaching once
+has none configured. The session is named as typed, so the list and every status
+line call it what the user called it. Nothing is written to `hosts.toml` — saving
+it is what `a` is for.
+
+An exact match against an inventory *name* is taken to mean that host, and is
+dialled through `dial` so its auth, jump chain and forwards come with it. Not a
+convenience: the ad-hoc reading would go straight at the bare name with the agent
+and fail on a host that needs a key through a bastion, with its settings sitting
+unused in the inventory. The status says `saved host:` out loud, because the
+address dialled need not resemble the name typed, and reaching a different machine
+silently is the failure this avoids. Adding a user or a port stops it matching a
+name, which is the escape hatch when an entry shares a spelling with a real
+hostname.
+
 **A host may hold several sessions.** `↵` on a connected host still *resumes* —
 it has to, or a stray Enter would strand another shell on the remote — so `n` is
 the deliberate ask for another. `session_for` returns the first live session for a
@@ -99,6 +130,17 @@ view over the same `sessions` vector rather than a second place sessions live �
 markers rather than reading a list of what is actually open. Selection is clamped
 in `prune_dead_sessions`, so a session ending under the cursor cannot leave the
 index past the end.
+
+**Switching sessions clears the screen; resuming one does not** (`ssh::attach`,
+`App::should_clear_for`). Sessions share the primary screen, so the text the
+previous one wrote is still on it — and landing in a shell that still shows
+another host's output means you cannot tell which machine you are typing at. The
+condition is narrow on purpose: the backlog is *drained* on attach, so it holds
+only what arrived while detached, and clearing on a plain re-attach would bring an
+idle session back to a blank screen with nothing to replay onto it. The first
+attach does not clear either — that leftover text is the user's own shell.
+`LiveSession` carries an id for this, because position in `App::sessions` shifts
+as sessions end.
 
 **Restoring the terminal resets its colour** (`ui::resume`). `Theme::base` sets no
 background so the terminal's own theme and transparency show through, which means

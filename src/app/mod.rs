@@ -51,6 +51,8 @@ pub enum Mode {
     ConfirmImport,
     /// Browsing active detached sessions.
     SessionList,
+    /// Typing an `ssh`-style target to reach once, without saving it.
+    QuickConnect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +72,7 @@ pub enum Action {
     BulkEdit,
     ShowSessions,
     NewSession,
+    QuickConnect,
 }
 
 /// The one place key bindings are declared. Dispatch reads it and so does the
@@ -102,6 +105,12 @@ pub const BINDINGS: &[(KeyCode, &str, &str, Action)] = &[
     (KeyCode::Char('b'), "b", "bulk edit shown", Action::BulkEdit),
     (KeyCode::Char('s'), "s", "sessions", Action::ShowSessions),
     (KeyCode::Char('n'), "n", "new session", Action::NewSession),
+    (
+        KeyCode::Char('c'),
+        "c",
+        "quick connect",
+        Action::QuickConnect,
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +170,14 @@ pub struct App {
     pub selected: usize,
     /// Index into `sessions` for the dedicated session list view.
     pub session_selected: usize,
+    /// Which session the terminal last belonged to, by id.
+    ///
+    /// Attaching a *different* one has to clear the screen first; see
+    /// [`ssh::attach`]. Kept by id rather than index because rows shift as
+    /// sessions end.
+    last_attached: Option<u64>,
+    /// What has been typed into quick connect. Not a secret and not saved.
+    pub quick_input: String,
     pub tag_filter: Option<String>,
     pub status: Status,
     pub host_key_prompt: Option<PendingHostKey>,
@@ -209,6 +226,8 @@ impl App {
             filter: String::new(),
             selected: 0,
             session_selected: 0,
+            last_attached: None,
+            quick_input: String::new(),
             tag_filter: None,
             status: Status::Idle,
             host_key_prompt: None,
@@ -381,7 +400,13 @@ impl App {
 
         // `attach` reads the window size itself via TIOCGWINSZ so it can also
         // pick up pixel dimensions and track later resizes.
-        let result = self.runtime.block_on(ssh::attach(session));
+        // Only when replacing *another session's* screen. On the very first
+        // attach the leftover text is the user's own shell, which is context
+        // rather than confusion — wiping it would be gratuitous.
+        let switching = self.should_clear_for(session.id());
+        let attached_id = session.id();
+        let result = self.runtime.block_on(ssh::attach(session, switching));
+        self.last_attached = Some(attached_id);
 
         ui::resume()?;
         let _ = ui::set_title(ui::APP_TITLE);
@@ -509,6 +534,18 @@ impl App {
         self.sessions
             .iter()
             .position(|s| s.host == host && !s.has_ended())
+    }
+
+    /// How many live sessions this host holds.
+    ///
+    /// The host list shows it once there is more than one, because `↵` resumes
+    /// the first and nothing else would say the others exist — `s` is how you
+    /// reach them.
+    pub fn session_count(&self, host: &str) -> usize {
+        self.sessions
+            .iter()
+            .filter(|s| s.host == host && !s.has_ended())
+            .count()
     }
 
     /// Returns whether any session was removed, so the `●` markers get repainted.
@@ -745,6 +782,20 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::QuickConnect => match key.code {
+                KeyCode::Esc => {
+                    self.quick_input.clear();
+                    self.mode = Mode::Browse;
+                }
+                KeyCode::Enter => self.connect_typed_target(),
+                KeyCode::Backspace => {
+                    self.quick_input.pop();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.quick_input.push(c);
+                }
+                _ => {}
+            },
             Mode::Help => {
                 // Any key dismisses help.
                 self.mode = Mode::Browse;
@@ -822,6 +873,10 @@ impl App {
             }
             Action::ShowSessions => self.show_sessions(),
             Action::NewSession => self.open_new_session(),
+            Action::QuickConnect => {
+                self.quick_input.clear();
+                self.mode = Mode::QuickConnect;
+            }
         }
     }
 
@@ -1078,6 +1133,81 @@ impl App {
         self.dial(&host);
     }
 
+    /// Whether attaching session `id` has to clear the terminal first.
+    ///
+    /// Only when replacing *another session's* screen. On the very first attach
+    /// the leftover text is the user's own shell, which is context rather than
+    /// confusion — wiping it would be gratuitous.
+    fn should_clear_for(&self, id: u64) -> bool {
+        self.last_attached.is_some_and(|last| last != id)
+    }
+
+    /// Connect to whatever was typed into quick connect.
+    ///
+    /// A bad target leaves the prompt up with the text intact — the answer to a
+    /// mistyped port is to fix the port, not to type the whole thing again.
+    fn connect_typed_target(&mut self) {
+        // A name you already have configured means the saved host, not a bare
+        // address that happens to spell the same thing. It is both what was meant
+        // and the only reading that can work: dialling `web-01` with the agent
+        // would fail on a host that needs a key through a bastion, while its
+        // settings sat in the inventory unused. `user@web-01` or `web-01:22` do
+        // not match a *name*, so they still reach the literal host.
+        let typed = self.quick_input.trim().to_string();
+        if let Some(saved) = self
+            .inventory
+            .hosts
+            .iter()
+            // Case-insensitive, like the filter. DNS does not distinguish case
+            // either, so `DB-PRIMARY` and `db-primary` name the same machine and
+            // must resolve the same way — capitalisation should not decide
+            // whether the saved key and bastion get used.
+            .find(|host| host.name.eq_ignore_ascii_case(&typed))
+            .cloned()
+        {
+            self.quick_input.clear();
+            self.mode = Mode::Browse;
+
+            if let Some(index) = self.session_for(&typed) {
+                self.status = Status::Busy(format!("resuming {typed}…"));
+                self.pending_attach = Some(index);
+                return;
+            }
+
+            // `dial` resolves the chain from the inventory, so the jump hosts,
+            // auth and forwards all come with it.
+            self.dial(&saved);
+            // Said out loud: the address dialled may be nothing like the name
+            // typed, and silently reaching a different machine is the failure
+            // this whole branch exists to avoid.
+            if let Status::Busy(message) = &self.status {
+                self.status = Status::Busy(format!("saved host: {message}"));
+            }
+            return;
+        }
+
+        let host = match Host::from_target(&self.quick_input) {
+            Ok(host) => host,
+            Err(err) => {
+                self.status = Status::Error(err.to_string());
+                return;
+            }
+        };
+
+        // An identical target already open is resumed rather than dialled twice,
+        // matching what `↵` does in the list. `n` is still the way to ask for a
+        // second shell somewhere.
+        if let Some(index) = self.session_for(&host.name) {
+            self.status = Status::Busy(format!("resuming {}…", host.name));
+            self.pending_attach = Some(index);
+        } else {
+            self.dial_chain(vec![host]);
+        }
+
+        self.quick_input.clear();
+        self.mode = Mode::Browse;
+    }
+
     /// Open an *additional* session to the selected host, instead of resuming
     /// the one already there.
     ///
@@ -1112,6 +1242,24 @@ impl App {
                 return;
             }
         };
+
+        self.dial_chain(chain);
+    }
+
+    /// Connect a chain that is already resolved.
+    ///
+    /// Split from [`Self::dial`] for quick connect, whose target is not in the
+    /// inventory at all — `connection_chain` would rightly say it has never
+    /// heard of it. The chain is always one hop there: somewhere you are reaching
+    /// once has no jump host configured for it.
+    fn dial_chain(&mut self, chain: Vec<Host>) {
+        let Some(host) = chain.last().cloned() else {
+            return;
+        };
+        if self.connecting.contains_key(&host.name) {
+            self.status = Status::Busy(format!("still connecting to {}…", host.name));
+            return;
+        }
 
         self.status = match chain.len() {
             1 => Status::Busy(format!("connecting to {}… (esc cancels)", host.name)),
@@ -1508,6 +1656,7 @@ mod tests {
             prompt: kind.title().into(),
             echo: false,
             retry,
+            note: None,
         }
     }
 
@@ -2181,6 +2330,290 @@ mod tests {
             app.pending_attach, None,
             "should not fall through to another session"
         );
+    }
+
+    #[test]
+    fn c_opens_quick_connect_empty() {
+        let mut app = fresh_app("quickopen", vec![host("web-01", &[])]);
+        app.quick_input.push_str("stale");
+
+        press(&mut app, KeyCode::Char('c'));
+
+        assert_eq!(app.mode, Mode::QuickConnect);
+        assert!(
+            app.quick_input.is_empty(),
+            "left the previous target in the box"
+        );
+    }
+
+    #[test]
+    fn a_typed_target_dials_something_not_in_the_inventory() {
+        let mut app = fresh_app("quickdial", vec![host("web-01", &[])]);
+        press(&mut app, KeyCode::Char('c'));
+        for c in "deploy@10.9.9.9:2222".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::Browse, "should leave the prompt");
+        assert!(
+            app.connecting.contains_key("deploy@10.9.9.9:2222"),
+            "dialled {:?}",
+            app.connecting.keys().collect::<Vec<_>>()
+        );
+        // Reaching somewhere once must not add it to the inventory.
+        assert_eq!(app.inventory.hosts.len(), 1, "the inventory grew");
+    }
+
+    /// Typing a name you have configured must use that entry, not a bare address
+    /// spelled the same way. Dialling `db-primary` ad-hoc would go straight at it
+    /// with the agent and fail, ignoring the key and the bastion in the inventory.
+    #[test]
+    fn a_typed_name_that_is_saved_uses_the_saved_host() {
+        let mut bastion = host("bastion", &[]);
+        bastion.address = "10.0.0.254".into();
+        let mut target = host("db-primary", &[]);
+        target.jump = Some("bastion".into());
+
+        let mut app = fresh_app("quicksaved", vec![bastion, target]);
+        press(&mut app, KeyCode::Char('c'));
+        for c in "db-primary".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert!(
+            app.connecting.contains_key("db-primary"),
+            "dialled {:?}",
+            app.connecting.keys().collect::<Vec<_>>()
+        );
+        // "via 1 host" only appears when the chain came from the inventory — an
+        // ad-hoc target has no jump host to tunnel through.
+        assert!(
+            matches!(&app.status, Status::Busy(m) if m.contains("via 1 host")),
+            "did not resolve the saved jump chain, got {:?}",
+            app.status
+        );
+        // And it says so, because the address dialled need not resemble the name.
+        assert!(
+            matches!(&app.status, Status::Busy(m) if m.contains("saved host")),
+            "did not say it used the inventory, got {:?}",
+            app.status
+        );
+    }
+
+    /// The escape hatch: adding a user or a port stops it matching a *name*, so
+    /// the literal host is still reachable when an entry shares its spelling.
+    #[test]
+    fn a_user_or_port_reaches_the_literal_host_despite_a_saved_name() {
+        let mut app = fresh_app("quickliteral", vec![host("web-01", &[])]);
+        press(&mut app, KeyCode::Char('c'));
+        for c in "root@web-01".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert!(
+            app.connecting.contains_key("root@web-01"),
+            "did not dial the literal host: {:?}",
+            app.connecting.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !matches!(&app.status, Status::Busy(m) if m.contains("saved host")),
+            "treated it as the saved entry, got {:?}",
+            app.status
+        );
+    }
+
+    /// A saved name whose jump chain is broken has to report *that*, rather than
+    /// quietly falling back to dialling the bare name.
+    #[test]
+    fn a_saved_name_with_a_broken_chain_reports_the_chain() {
+        let mut target = host("db-primary", &[]);
+        target.jump = Some("no-such-bastion".into());
+        let mut app = fresh_app("quickbrokenchain", vec![target]);
+
+        press(&mut app, KeyCode::Char('c'));
+        for c in "db-primary".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert!(
+            matches!(&app.status, Status::Error(m) if m.contains("no-such-bastion")),
+            "got {:?}",
+            app.status
+        );
+        assert!(app.connecting.is_empty(), "dialled anyway");
+    }
+
+    /// A mistyped port is fixed by editing the port, so the prompt and the text
+    /// both have to survive the error.
+    #[test]
+    fn a_bad_target_keeps_the_prompt_up() {
+        let mut app = fresh_app("quickbad", vec![]);
+        press(&mut app, KeyCode::Char('c'));
+        for c in "host:not-a-port".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::QuickConnect, "dropped out of the prompt");
+        assert_eq!(app.quick_input, "host:not-a-port", "lost what was typed");
+        assert!(matches!(&app.status, Status::Error(m) if m.contains("port")));
+        assert!(
+            app.connecting.is_empty(),
+            "dialled a target it could not read"
+        );
+    }
+
+    #[test]
+    fn esc_abandons_quick_connect() {
+        let mut app = fresh_app("quickesc", vec![]);
+        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char('x'));
+
+        press(&mut app, KeyCode::Esc);
+
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.quick_input.is_empty());
+        assert!(app.connecting.is_empty());
+    }
+
+    /// Typing the same target twice should land back in the session you already
+    /// have, the same way `↵` behaves in the list.
+    #[test]
+    fn a_typed_target_that_is_already_open_resumes_it() {
+        let mut app = fresh_app("quickresume", vec![]);
+        let (session, _keepalive) = ssh::LiveSession::for_test("deploy@10.9.9.9");
+        app.sessions.push(session);
+
+        press(&mut app, KeyCode::Char('c'));
+        for c in "deploy@10.9.9.9".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.pending_attach, Some(0), "should resume, not redial");
+        assert!(app.connecting.is_empty());
+    }
+
+    /// Sessions share the primary screen, so switching to another one has to
+    /// clear it — landing in a shell that still shows a different host's output
+    /// means you cannot tell which machine you are typing at. Re-attaching the
+    /// *same* session must not clear: the backlog is drained on attach, so an
+    /// idle session would come back to a blank screen with nothing to replay.
+    #[test]
+    fn switching_sessions_clears_the_screen_but_resuming_one_does_not() {
+        let mut app = fresh_app("clearscreen", vec![]);
+        let (alpha, _ka) = ssh::LiveSession::for_test("alpha");
+        let (beta, _kb) = ssh::LiveSession::for_test("beta");
+        let (alpha_id, beta_id) = (alpha.id(), beta.id());
+        app.sessions.push(alpha);
+        app.sessions.push(beta);
+
+        // Nothing attached yet: the leftover text is the user's own shell.
+        assert!(
+            !app.should_clear_for(alpha_id),
+            "cleared on the first attach"
+        );
+
+        app.last_attached = Some(alpha_id);
+        assert!(
+            !app.should_clear_for(alpha_id),
+            "cleared on a plain re-attach"
+        );
+        assert!(
+            app.should_clear_for(beta_id),
+            "did not clear when switching"
+        );
+    }
+
+    /// A session dying does not make the *next* attach a re-attach. Ids are never
+    /// reused, so a reconnect to the same host is still a different session and
+    /// still has to clear the previous one's screen.
+    #[test]
+    fn a_reconnect_after_a_death_still_counts_as_switching() {
+        let mut app = fresh_app("clearafterdeath", vec![host("web-01", &[])]);
+        let (first, _r1) = ssh::LiveSession::for_test("web-01");
+        let first_id = first.id();
+        app.sessions.push(first);
+        app.last_attached = Some(first_id);
+
+        app.sessions[0].mark_ended_for_test();
+        app.prune_dead_sessions();
+
+        let (second, _r2) = ssh::LiveSession::for_test("web-01");
+        assert_ne!(second.id(), first_id, "ids must not be reused");
+        assert!(
+            app.should_clear_for(second.id()),
+            "a fresh session on the same host reused the dead one's screen"
+        );
+    }
+
+    /// Capitalisation must not decide whether the inventory is consulted.
+    #[test]
+    fn a_typed_name_matches_the_saved_host_whatever_the_case() {
+        let mut target = host("db-primary", &[]);
+        target.jump = Some("bastion".into());
+        let mut bastion = host("bastion", &[]);
+        bastion.address = "10.0.0.254".into();
+        let mut app = fresh_app("quickcase", vec![bastion, target]);
+
+        press(&mut app, KeyCode::Char('c'));
+        for c in "DB-Primary".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert!(
+            matches!(&app.status, Status::Busy(m) if m.contains("saved host")),
+            "case defeated the inventory lookup, got {:?}",
+            app.status
+        );
+    }
+
+    /// Whitespace around a typed name still finds the saved host — the trim has to
+    /// happen before the lookup, not only inside the parser.
+    #[test]
+    fn a_padded_typed_name_still_matches_the_saved_host() {
+        let mut target = host("db-primary", &[]);
+        target.jump = Some("bastion".into());
+        let mut bastion = host("bastion", &[]);
+        bastion.address = "10.0.0.254".into();
+        let mut app = fresh_app("quickpadded", vec![bastion, target]);
+
+        press(&mut app, KeyCode::Char('c'));
+        for c in "  db-primary  ".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert!(
+            matches!(&app.status, Status::Busy(m) if m.contains("saved host")),
+            "padding defeated the inventory lookup, got {:?}",
+            app.status
+        );
+    }
+
+    /// Backspacing the whole target and pressing enter must not dial anything.
+    #[test]
+    fn an_emptied_quick_connect_prompt_dials_nothing() {
+        let mut app = fresh_app("quickemptied", vec![]);
+        press(&mut app, KeyCode::Char('c'));
+        for c in "abc".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.quick_input.is_empty());
+        assert!(app.connecting.is_empty(), "dialled an empty target");
+        assert_eq!(app.mode, Mode::QuickConnect, "left the prompt on an error");
     }
 
     /// `↵` on a connected host must keep resuming. If it opened a second shell
