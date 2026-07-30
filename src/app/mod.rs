@@ -69,6 +69,7 @@ pub enum Action {
     ImportPutty,
     BulkEdit,
     ShowSessions,
+    NewSession,
 }
 
 /// The one place key bindings are declared. Dispatch reads it and so does the
@@ -100,6 +101,7 @@ pub const BINDINGS: &[(KeyCode, &str, &str, Action)] = &[
     (KeyCode::Char('i'), "i", "import hosts", Action::ImportPutty),
     (KeyCode::Char('b'), "b", "bulk edit shown", Action::BulkEdit),
     (KeyCode::Char('s'), "s", "sessions", Action::ShowSessions),
+    (KeyCode::Char('n'), "n", "new session", Action::NewSession),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -510,11 +512,33 @@ impl App {
     }
 
     /// Returns whether any session was removed, so the `●` markers get repainted.
+    ///
+    /// Says so when one goes. These are sessions that died while *detached* — a
+    /// dropped connection, or a remote that closed the shell — and dropping the
+    /// row silently means you press `s`, find nothing, and are left guessing.
+    /// The foreground case is already reported by [`Self::attach`], which sees
+    /// the outcome directly, so nothing is announced twice.
     fn prune_dead_sessions(&mut self) -> bool {
-        let before = self.sessions.len();
+        let ended: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|s| s.has_ended())
+            .map(|s| s.host.clone())
+            .collect();
+        if ended.is_empty() {
+            return false;
+        }
+
         self.sessions.retain(|s| !s.has_ended());
         self.clamp_session_selection();
-        self.sessions.len() != before
+
+        // `Error`, not `Ok`: a session you were relying on being there has gone,
+        // which is the same reason the keepalive exists at all.
+        self.status = Status::Error(match ended.as_slice() {
+            [host] => format!("the session on {host} ended"),
+            hosts => format!("{} sessions ended: {}", hosts.len(), hosts.join(", ")),
+        });
+        true
     }
 
     /// Answer a pending host key prompt. Taking the prompt out of `self` means a
@@ -777,6 +801,7 @@ impl App {
                 }
             }
             Action::ShowSessions => self.show_sessions(),
+            Action::NewSession => self.open_new_session(),
         }
     }
 
@@ -1022,16 +1047,37 @@ impl App {
             return;
         };
 
-        // Already connected: resume rather than opening a second session.
+        // Already connected: resume rather than opening a second session. `n`
+        // is how you ask for another one deliberately.
         if let Some(index) = self.session_for(&host.name) {
             self.status = Status::Busy(format!("resuming {}…", host.name));
             self.pending_attach = Some(index);
             return;
         }
 
+        self.dial(&host);
+    }
+
+    /// Open an *additional* session to the selected host, instead of resuming
+    /// the one already there.
+    ///
+    /// A build running in one shell while you edit in another is ordinary SSH
+    /// work, and `↵` cannot serve both meanings — it has to keep resuming, or
+    /// every stray Enter on a connected host would open another shell.
+    fn open_new_session(&mut self) {
+        let Some(host) = self.selected_host().cloned() else {
+            return;
+        };
+        self.dial(&host);
+    }
+
+    /// Start a connection, whatever else is already open to this host.
+    fn dial(&mut self, host: &Host) {
         // Already dialling. A connect can sit for a long time — an unroutable
         // address waits out the TCP timeout — and every extra Enter would start
-        // another one.
+        // another one. `connecting` is keyed by host, so this also caps a host
+        // at one *in-flight* dial: a second session is something you ask for
+        // once the first has actually come up.
         if self.connecting.contains_key(&host.name) {
             self.status = Status::Busy(format!("still connecting to {}…", host.name));
             return;
@@ -2058,6 +2104,82 @@ mod tests {
         assert!(
             matches!(&app.status, Status::Busy(m) if m.contains("still connecting")),
             "should say it is already dialling, got {:?}",
+            app.status
+        );
+    }
+
+    /// `↵` on a connected host must keep resuming. If it opened a second shell
+    /// instead, every stray Enter would leave one behind on the remote.
+    #[test]
+    fn enter_on_a_connected_host_resumes_rather_than_opening_another() {
+        let mut app = fresh_app("resumenotnew", vec![host("web-01", &[])]);
+        let (session, _keepalive) = ssh::LiveSession::for_test("web-01");
+        app.sessions.push(session);
+
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.pending_attach,
+            Some(0),
+            "should resume the existing one"
+        );
+        assert!(
+            app.connecting.is_empty(),
+            "started a second connection instead of resuming"
+        );
+    }
+
+    /// `n` is the deliberate ask for another shell on a host that already has one.
+    #[test]
+    fn n_opens_a_second_session_on_a_connected_host() {
+        let mut app = fresh_app("newsession", vec![host("web-01", &[])]);
+        let (session, _keepalive) = ssh::LiveSession::for_test("web-01");
+        app.sessions.push(session);
+
+        press(&mut app, KeyCode::Char('n'));
+
+        assert!(
+            app.connecting.contains_key("web-01"),
+            "no second connection was started"
+        );
+        assert!(
+            app.pending_attach.is_none(),
+            "resumed the existing session instead of dialling"
+        );
+    }
+
+    /// A session that dies while detached must be reported, not just dropped.
+    /// The row vanishing on its own leaves you pressing `s`, finding nothing,
+    /// and guessing why.
+    #[test]
+    fn a_session_that_dies_while_detached_is_announced() {
+        let mut app = fresh_app("deadsession", vec![host("web-01", &[])]);
+        let (session, _keepalive) = ssh::LiveSession::for_test("db-primary");
+        app.sessions.push(session);
+
+        app.sessions[0].mark_ended_for_test();
+        assert!(app.prune_dead_sessions(), "should report a change");
+
+        assert!(app.sessions.is_empty());
+        assert!(
+            matches!(&app.status, Status::Error(m) if m.contains("db-primary")),
+            "should name the host that went, got {:?}",
+            app.status
+        );
+    }
+
+    /// Nothing to say when nothing died — this runs on every pass of the loop.
+    #[test]
+    fn pruning_with_nothing_dead_says_nothing() {
+        let mut app = fresh_app("nodeadsession", vec![host("web-01", &[])]);
+        let (session, _keepalive) = ssh::LiveSession::for_test("web-01");
+        app.sessions.push(session);
+        app.status = Status::Ok("something else".into());
+
+        assert!(!app.prune_dead_sessions());
+        assert!(
+            matches!(&app.status, Status::Ok(m) if m == "something else"),
+            "clobbered an unrelated status, got {:?}",
             app.status
         );
     }

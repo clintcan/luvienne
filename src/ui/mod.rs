@@ -839,11 +839,40 @@ fn name_column_width(longest_name: usize) -> u16 {
         .max(FLOOR)
 }
 
+/// One label per session, in `app.sessions` order.
+///
+/// A host can hold several sessions now, and two rows reading `web-01` are a
+/// list you cannot act on. Numbered by order of opening, and only where there is
+/// something to tell apart — a lone session should not read `web-01 #1`.
+fn session_labels(app: &App) -> Vec<String> {
+    let mut totals: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for session in &app.sessions {
+        *totals.entry(session.host.as_str()).or_default() += 1;
+    }
+
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    app.sessions
+        .iter()
+        .map(|session| {
+            let host = session.host.as_str();
+            let nth = seen.entry(host).or_default();
+            *nth += 1;
+            if totals[host] > 1 {
+                format!("{host} #{nth}")
+            } else {
+                host.to_string()
+            }
+        })
+        .collect()
+}
+
 fn render_sessions(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let viewport = area.height.saturating_sub(3) as usize;
     let offset = app
         .session_selected
         .saturating_sub(viewport.saturating_sub(1));
+
+    let labels = session_labels(app);
 
     let rows: Vec<Row> = app
         .sessions
@@ -851,13 +880,13 @@ fn render_sessions(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
         .enumerate()
         .skip(offset)
         .take(viewport)
-        .map(|(i, session)| {
+        .map(|(i, _)| {
             let style = if i == app.session_selected {
                 theme.selected()
             } else {
                 theme.base()
             };
-            Row::new(vec![format!("  {}", session.host), "detached".to_string()]).style(style)
+            Row::new(vec![format!("  {}", labels[i]), "detached".to_string()]).style(style)
         })
         .collect();
 
@@ -1930,6 +1959,29 @@ mod tests {
         assert!(out.contains("alpha"), "first session shown:\n{out}");
         assert!(out.contains("beta"), "second session shown:\n{out}");
         assert!(out.contains("detached"), "state shown:\n{out}");
+    }
+
+    /// Two sessions on one host have to be told apart, and a lone session must
+    /// not be numbered for no reason.
+    #[test]
+    fn several_sessions_on_one_host_are_numbered() {
+        let mut app = app_with(vec![]);
+        app.sessions.push(ssh::LiveSession::for_test("web-01").0);
+        app.sessions
+            .push(ssh::LiveSession::for_test("db-primary").0);
+        app.sessions.push(ssh::LiveSession::for_test("web-01").0);
+        app.mode = Mode::SessionList;
+
+        let out = draw(&app, 100, 24);
+        assert!(out.contains("web-01 #1"), "first web-01 unnumbered:\n{out}");
+        assert!(
+            out.contains("web-01 #2"),
+            "second web-01 unnumbered:\n{out}"
+        );
+        assert!(
+            !out.contains("db-primary #"),
+            "numbered a host with one session:\n{out}"
+        );
     }
 
     #[test]

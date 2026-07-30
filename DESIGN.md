@@ -78,6 +78,20 @@ we restore the alternate screen and return to the host list.
 **A session outlives any one attach.** `Ctrl-]` detaches back to the host list
 leaving the remote shell running; the list marks it `●` and `↵` resumes it.
 
+**A host may hold several sessions.** `↵` on a connected host still *resumes* —
+it has to, or a stray Enter would strand another shell on the remote — so `n` is
+the deliberate ask for another. `session_for` returns the first live session for a
+host and is what the `●` marker and `↵` use; the session list is how you reach the
+rest, numbering rows only where a host appears more than once. `connecting` stays
+keyed by host name, which caps a host at one *in-flight* dial: a second session is
+something you ask for once the first is actually up.
+
+**A session that dies while detached is announced.** `prune_dead_sessions` names
+the host rather than just dropping the row — the whole point of the keepalive is
+that `●` never lies, and a row vanishing on its own leaves the user pressing `s`,
+finding nothing, and guessing. The foreground case is left to `attach`, which sees
+the outcome directly, so nothing is reported twice.
+
 `s` opens a dedicated list of detached sessions (`Mode::SessionList`), which is a
 view over the same `sessions` vector rather than a second place sessions live —
 `↵` there sets the same `pending_attach` the host list does. It exists because
