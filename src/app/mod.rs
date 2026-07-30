@@ -403,7 +403,7 @@ impl App {
         // Only when replacing *another session's* screen. On the very first
         // attach the leftover text is the user's own shell, which is context
         // rather than confusion — wiping it would be gratuitous.
-        let switching = self.should_clear_for(session.id());
+        let switching = self.switching_to(session.id());
         let attached_id = session.id();
         let result = self.runtime.block_on(ssh::attach(session, switching));
         self.last_attached = Some(attached_id);
@@ -1133,12 +1133,12 @@ impl App {
         self.dial(&host);
     }
 
-    /// Whether attaching session `id` has to clear the terminal first.
+    /// Whether attaching session `id` means moving from a *different* one.
     ///
-    /// Only when replacing *another session's* screen. On the very first attach
-    /// the leftover text is the user's own shell, which is context rather than
-    /// confusion — wiping it would be gratuitous.
-    fn should_clear_for(&self, id: u64) -> bool {
+    /// Drives the rule [`ssh::attach`] draws to mark the seam. False on the very
+    /// first attach: the text above is then the user's own shell, and announcing
+    /// a boundary they did not cross would be noise.
+    fn switching_to(&self, id: u64) -> bool {
         self.last_attached.is_some_and(|last| last != id)
     }
 
@@ -2500,13 +2500,11 @@ mod tests {
         assert!(app.connecting.is_empty());
     }
 
-    /// Sessions share the primary screen, so switching to another one has to
-    /// clear it — landing in a shell that still shows a different host's output
-    /// means you cannot tell which machine you are typing at. Re-attaching the
-    /// *same* session must not clear: the backlog is drained on attach, so an
-    /// idle session would come back to a blank screen with nothing to replay.
+    /// Sessions share the primary screen, so moving to another one is marked with
+    /// a rule naming it — otherwise you cannot tell which machine you are typing
+    /// at. Re-attaching the *same* session marks nothing: no boundary was crossed.
     #[test]
-    fn switching_sessions_clears_the_screen_but_resuming_one_does_not() {
+    fn switching_sessions_is_marked_but_resuming_one_is_not() {
         let mut app = fresh_app("clearscreen", vec![]);
         let (alpha, _ka) = ssh::LiveSession::for_test("alpha");
         let (beta, _kb) = ssh::LiveSession::for_test("beta");
@@ -2515,20 +2513,11 @@ mod tests {
         app.sessions.push(beta);
 
         // Nothing attached yet: the leftover text is the user's own shell.
-        assert!(
-            !app.should_clear_for(alpha_id),
-            "cleared on the first attach"
-        );
+        assert!(!app.switching_to(alpha_id), "cleared on the first attach");
 
         app.last_attached = Some(alpha_id);
-        assert!(
-            !app.should_clear_for(alpha_id),
-            "cleared on a plain re-attach"
-        );
-        assert!(
-            app.should_clear_for(beta_id),
-            "did not clear when switching"
-        );
+        assert!(!app.switching_to(alpha_id), "cleared on a plain re-attach");
+        assert!(app.switching_to(beta_id), "did not clear when switching");
     }
 
     /// A session dying does not make the *next* attach a re-attach. Ids are never
@@ -2548,8 +2537,8 @@ mod tests {
         let (second, _r2) = ssh::LiveSession::for_test("web-01");
         assert_ne!(second.id(), first_id, "ids must not be reused");
         assert!(
-            app.should_clear_for(second.id()),
-            "a fresh session on the same host reused the dead one's screen"
+            app.switching_to(second.id()),
+            "a fresh session on the same host was treated as a re-attach"
         );
     }
 

@@ -71,6 +71,8 @@ Both are real frames rendered by the app, with invented hosts.
   offered for resume, and one that dies while detached says so rather than
   disappearing. `s` lists what is detached once you have more than a couple to
   keep track of, and `n` opens another shell on a host that already has one.
+  Moving between sessions draws a rule naming the one you have arrived at, since
+  they share the terminal's scrollback.
 - **Quick connect** with `c` for somewhere that is not in the list — type
   `user@host:port` the way you would after `ssh`. It uses the agent, asks for a
   username if you leave one out, and is not written to the inventory. Type a name

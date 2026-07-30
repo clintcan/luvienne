@@ -1270,6 +1270,19 @@ async fn write_session_output(
     stdout.flush().await
 }
 
+/// A rule naming the session the terminal has just been handed to.
+///
+/// CRLF at both ends because the terminal is in raw mode, and dim so it reads as
+/// ours rather than as something the remote printed. Falls back to 80 columns if
+/// the size cannot be read — a short rule is a cosmetic loss, and refusing to
+/// draw one would leave the seam unmarked.
+fn switch_rule(host: &str) -> Vec<u8> {
+    let columns = window_size().map_or(80usize, |(cols, ..)| cols as usize);
+    let label = format!("── {host} ");
+    let fill = columns.saturating_sub(unicode_width::UnicodeWidthStr::width(label.as_str()));
+    format!("\r\n\x1b[2m{label}{}\x1b[0m\r\n", "─".repeat(fill)).into_bytes()
+}
+
 /// The key that detaches from a session and returns to the host list.
 ///
 /// `Ctrl-]`, the telnet escape. Chosen because shells and full-screen programs
@@ -1309,15 +1322,19 @@ pub async fn attach(session: &LiveSession, switching: bool) -> Result<SessionOut
     let resuming = !session.take_first_attach();
     let mut stdout = tokio::io::stdout();
 
-    // Sessions share the primary screen, so the text the *previous* one wrote is
-    // still on it. Landing in a shell showing another host's output is worse than
-    // confusing — you cannot tell which machine you are typing at.
+    // Sessions share the primary screen, so the text above belongs to whichever
+    // one you left. A rule naming this host says where the boundary is, which was
+    // the actual problem — not being able to tell which machine you are typing at.
     //
-    // Only when switching. The backlog is drained on attach, so it holds just
-    // what arrived while detached: clearing on a plain re-attach of an idle
-    // session would leave a blank screen with nothing to replay onto it.
-    if switching {
-        write_session_output(&mut stdout, b"\x1b[2J\x1b[H").await?;
+    // Clearing instead was worse: a shell has nothing to repaint, so switching
+    // landed on a blank screen. Keeping the scrollback and marking the seam costs
+    // one line and loses no context.
+    //
+    // Not into a full-screen program's buffer, though: it repaints on the resize
+    // nudge below, and a line of ours in the middle of its display would corrupt
+    // it — the same reason the detach banner is first-attach only.
+    if switching && !session.remote_in_alt_screen() {
+        write_session_output(&mut stdout, &switch_rule(&session.host)).await?;
     }
 
     if resuming {
@@ -1707,6 +1724,49 @@ mod tests {
     fn detach_key_splits_input_and_is_not_forwarded() {
         // Nothing typed before it.
         assert_eq!(split_at_detach(&[DETACH_KEY]), Some(&b""[..]));
+    }
+
+    /// The rule marks the seam between two sessions, so it has to name the host
+    /// and it has to be ours to look at — dim, on its own lines, reset after.
+    #[test]
+    fn the_switch_rule_names_the_host_and_stands_alone() {
+        let rule = String::from_utf8(switch_rule("db-primary")).unwrap();
+
+        assert!(
+            rule.contains("db-primary"),
+            "does not name the host: {rule:?}"
+        );
+        assert!(
+            rule.starts_with("\r\n"),
+            "runs on from the previous line: {rule:?}"
+        );
+        assert!(
+            rule.ends_with("\r\n"),
+            "leaves the cursor on the rule: {rule:?}"
+        );
+        assert!(rule.contains("\x1b[2m"), "not dimmed: {rule:?}");
+        assert!(rule.ends_with("\x1b[0m\r\n"), "leaves styling on: {rule:?}");
+    }
+
+    /// A long host name must not push the rule past the edge and wrap it onto a
+    /// second line — the seam is one line or it reads as output.
+    #[test]
+    fn the_switch_rule_fits_one_line() {
+        for host in ["a", "db-primary", &"very-long-hostname".repeat(8)] {
+            let rule = String::from_utf8(switch_rule(host)).unwrap();
+            let visible: String = rule
+                .replace("\r\n", "")
+                .replace("\x1b[2m", "")
+                .replace("\x1b[0m", "");
+            let width = unicode_width::UnicodeWidthStr::width(visible.as_str());
+            // 80 is the fallback when the size cannot be read, which is the case
+            // under the test harness.
+            let limit = 80.max(unicode_width::UnicodeWidthStr::width(host) + 4);
+            assert!(
+                width <= limit,
+                "rule is {width} wide for {host:?}, limit {limit}"
+            );
+        }
         // Typed mid-line: the remote still gets what came before.
         assert_eq!(split_at_detach(b"ls\x1d"), Some(&b"ls"[..]));
         // Anything after the key is dropped with it.

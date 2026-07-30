@@ -131,16 +131,26 @@ markers rather than reading a list of what is actually open. Selection is clampe
 in `prune_dead_sessions`, so a session ending under the cursor cannot leave the
 index past the end.
 
-**Switching sessions clears the screen; resuming one does not** (`ssh::attach`,
-`App::should_clear_for`). Sessions share the primary screen, so the text the
-previous one wrote is still on it — and landing in a shell that still shows
-another host's output means you cannot tell which machine you are typing at. The
-condition is narrow on purpose: the backlog is *drained* on attach, so it holds
-only what arrived while detached, and clearing on a plain re-attach would bring an
-idle session back to a blank screen with nothing to replay onto it. The first
-attach does not clear either — that leftover text is the user's own shell.
-`LiveSession` carries an id for this, because position in `App::sessions` shifts
-as sessions end.
+**Switching sessions draws a rule; resuming one draws nothing** (`ssh::switch_rule`,
+`App::switching_to`). Sessions share the primary screen, so the text above belongs
+to whichever session you left — and not being able to tell which machine you are
+typing at was the actual problem.
+
+Clearing the screen was the first attempt and it was worse: a shell has nothing to
+repaint, so switching landed on a blank screen. A rule naming the host marks the
+seam, keeps the scrollback, and costs one line. It is skipped when the remote is in
+its alternate screen — that repaints on the resize nudge anyway, and a line of ours
+inside a full-screen program's display would corrupt it, the same reason the detach
+banner is first-attach only.
+
+A per-session *screen* would mean parsing every byte into a grid and painting it on
+attach — which is what `screen` and `tmux` do, and what "we do not implement a
+terminal emulator" rules out. Delegating to a remote multiplexer is the cheaper
+answer if it is ever wanted, and it survives this process dying, which no grid of
+ours would.
+
+`LiveSession` carries an id for the switching test, because position in
+`App::sessions` shifts as sessions end.
 
 **Restoring the terminal resets its colour** (`ui::resume`). `Theme::base` sets no
 background so the terminal's own theme and transparency show through, which means
