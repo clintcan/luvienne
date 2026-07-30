@@ -529,6 +529,26 @@ impl App {
             return false;
         }
 
+        // A pending resume holds an *index*, and it was set on an earlier pass of
+        // the loop — key handling runs after this. Dropping rows beneath it would
+        // silently point it at a different session: ask for the second of three,
+        // lose the first, attach the third. Remap before the retain, and give up
+        // on it entirely if the session it named is the one that died.
+        if let Some(pending) = self.pending_attach {
+            self.pending_attach = match self.sessions.get(pending) {
+                // Already stale; nothing to salvage.
+                None => None,
+                Some(session) if session.has_ended() => None,
+                Some(_) => {
+                    let gone_below = self.sessions[..pending]
+                        .iter()
+                        .filter(|s| s.has_ended())
+                        .count();
+                    Some(pending - gone_below)
+                }
+            };
+        }
+
         self.sessions.retain(|s| !s.has_ended());
         self.clamp_session_selection();
 
@@ -2105,6 +2125,61 @@ mod tests {
             matches!(&app.status, Status::Busy(m) if m.contains("still connecting")),
             "should say it is already dialling, got {:?}",
             app.status
+        );
+    }
+
+    /// A pending resume is an index into `sessions`, set a pass of the loop
+    /// before it is used, and `prune_dead_sessions` runs in between. Without a
+    /// remap, losing a session below it attaches something else entirely — ask
+    /// for the second of three, lose the first, get the third.
+    #[test]
+    fn a_pending_resume_still_points_at_its_own_session_after_a_death() {
+        let mut app = fresh_app("qaprobe", vec![]);
+        let (alpha, _ka) = ssh::LiveSession::for_test("alpha");
+        let (beta, _kb) = ssh::LiveSession::for_test("beta");
+        let (gamma, _kg) = ssh::LiveSession::for_test("gamma");
+        app.sessions.push(alpha);
+        app.sessions.push(beta);
+        app.sessions.push(gamma);
+
+        // The user picked beta (index 1) in the session list.
+        app.session_selected = 1;
+        app.mode = Mode::SessionList;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pending_attach, Some(1));
+
+        // alpha dies before the loop gets to the attach.
+        app.sessions[0].mark_ended_for_test();
+        app.prune_dead_sessions();
+
+        let target = app
+            .pending_attach
+            .and_then(|i| app.sessions.get(i))
+            .map(|s| s.host.clone());
+        assert_eq!(
+            target.as_deref(),
+            Some("beta"),
+            "pending resume now points at {target:?} instead of beta"
+        );
+    }
+
+    /// And if the session it named is the one that died, the resume is given up
+    /// rather than pointed at a neighbour.
+    #[test]
+    fn a_pending_resume_is_dropped_when_its_own_session_dies() {
+        let mut app = fresh_app("qapendingdead", vec![]);
+        let (alpha, _ka) = ssh::LiveSession::for_test("alpha");
+        let (beta, _kb) = ssh::LiveSession::for_test("beta");
+        app.sessions.push(alpha);
+        app.sessions.push(beta);
+        app.pending_attach = Some(1);
+
+        app.sessions[1].mark_ended_for_test();
+        app.prune_dead_sessions();
+
+        assert_eq!(
+            app.pending_attach, None,
+            "should not fall through to another session"
         );
     }
 
