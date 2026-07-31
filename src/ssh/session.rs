@@ -58,6 +58,42 @@ pub enum Output {
     Ended(Option<u32>),
 }
 
+/// The bytes an attach is sent, and the backlog left behind.
+///
+/// The tail is a screenful of context; the backlog is everything actually
+/// missed. Never trade the second for the first — arriving without context is a
+/// nuisance, losing a build's output is a bug. So the tail only wins when it
+/// already covers everything the backlog holds.
+fn replay_bytes(replay: Replay, tail: &VecDeque<u8>, backlog: &mut VecDeque<u8>) -> Vec<u8> {
+    match replay {
+        Replay::Recent if backlog.len() <= tail.len() => {
+            backlog.clear();
+            // Repainting old output must not ring old bells or set titles and
+            // clipboards a second time.
+            strip_side_effects(&tail.iter().copied().collect::<Vec<_>>())
+        }
+        // Either nothing was missed and the tail is the context, or more was
+        // missed than the tail holds. Both are first-arrival output, where a
+        // bell is a real bell.
+        Replay::Recent | Replay::Missed => backlog.drain(..).collect(),
+    }
+}
+
+/// Which replay an attach should ask for.
+///
+/// A full-screen program is deliberately excluded from `Recent`. It repaints
+/// itself from the resize nudge, so replaying is unnecessary — and dangerous,
+/// because its output contains alternate-screen switches (`ESC[?1049h/l`) that
+/// `strip_side_effects` does not remove: replaying those flips the terminal's
+/// buffer underneath a remote that believes it is still in the other one.
+pub fn replay_for(switching: bool, remote_in_alt_screen: bool) -> Replay {
+    if switching && !remote_in_alt_screen {
+        Replay::Recent
+    } else {
+        Replay::Missed
+    }
+}
+
 /// What an attach wants replayed onto the screen it is landing on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Replay {
@@ -432,19 +468,7 @@ async fn run(
                     // `Recent` supersedes the backlog: the tail already contains
                     // everything the backlog does, so sending both would print
                     // the missed output twice.
-                    let bytes: Vec<u8> = match replay {
-                        // Repainting old output must not ring old bells or set
-                        // titles and clipboards a second time.
-                        Replay::Recent => {
-                            strip_side_effects(&tail.iter().copied().collect::<Vec<_>>())
-                        }
-                        // Not stripped: this is output arriving for the first
-                        // time, merely late. A bell in it is a real bell.
-                        Replay::Missed => backlog.drain(..).collect(),
-                    };
-                    if replay == Replay::Recent {
-                        backlog.clear();
-                    }
+                    let bytes = replay_bytes(replay, &tail, &mut backlog);
                     if !bytes.is_empty() && sink.send(Output::Bytes(bytes)).is_err() {
                         continue;
                     }
@@ -515,6 +539,25 @@ mod tests {
         assert_eq!(strip_side_effects(painted), painted);
     }
 
+    /// A full-screen program repaints itself, and replaying its bytes would flip
+    /// the terminal's buffer under it — `ESC[?1049h/l` is not stripped, and is
+    /// not the sort of thing that can be stripped safely.
+    #[test]
+    fn a_full_screen_session_is_never_sent_its_own_output_again() {
+        assert_eq!(
+            replay_for(true, false),
+            Replay::Recent,
+            "a shell wants context"
+        );
+        assert_eq!(
+            replay_for(true, true),
+            Replay::Missed,
+            "a full-screen program must not be replayed into"
+        );
+        assert_eq!(replay_for(false, false), Replay::Missed, "a re-attach");
+        assert_eq!(replay_for(false, true), Replay::Missed);
+    }
+
     /// The tail is capped, and a trim starts on a fresh line — cutting mid-escape
     /// would replay half a control sequence and paint garbage.
     #[test]
@@ -532,6 +575,41 @@ mod tests {
         );
         // The end is what matters: it is the most recent output.
         assert!(text.ends_with(b"\n"), "lost the end of the tail");
+    }
+
+    /// Switching must not cost you output. The tail is a screenful of context;
+    /// when more was missed than that, the backlog is what has to be sent.
+    #[test]
+    fn a_switch_never_trades_missed_output_for_context() {
+        let tail: VecDeque<u8> = b"context\x07 and a bell".iter().copied().collect();
+
+        // Idle session: nothing was missed, so the tail is all there is —
+        // stripped, because it repaints what was already shown once.
+        let mut empty = VecDeque::new();
+        let sent = replay_bytes(Replay::Recent, &tail, &mut empty);
+        assert_eq!(
+            sent, b"context and a bell",
+            "the tail was not replayed clean"
+        );
+
+        // More missed than the tail holds: the backlog wins, and intact.
+        let missed: Vec<u8> = std::iter::repeat_n(b'x', tail.len() + 1).collect();
+        let mut backlog: VecDeque<u8> = missed.iter().copied().collect();
+        let sent = replay_bytes(Replay::Recent, &tail, &mut backlog);
+        assert_eq!(sent, missed, "a build's output was dropped for a screenful");
+        assert!(backlog.is_empty(), "the backlog was sent but not drained");
+    }
+
+    /// Returning to a session's own screen sends only what it missed, or the
+    /// output already on the terminal would be printed a second time.
+    #[test]
+    fn a_re_attach_sends_only_what_was_missed() {
+        let tail: VecDeque<u8> = b"already on screen".iter().copied().collect();
+        let mut backlog: VecDeque<u8> = b"arrived while away".iter().copied().collect();
+
+        let sent = replay_bytes(Replay::Missed, &tail, &mut backlog);
+        assert_eq!(sent, b"arrived while away");
+        assert!(backlog.is_empty());
     }
 
     #[test]

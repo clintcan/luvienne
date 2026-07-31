@@ -1318,11 +1318,7 @@ pub async fn attach(session: &LiveSession, switching: bool) -> Result<SessionOut
     // terminal at all, so its recent output has to be put back — otherwise the
     // rule is followed by nothing until you press enter, because the remote
     // already printed its prompt and will not print another unprompted.
-    let replay = if switching {
-        session::Replay::Recent
-    } else {
-        session::Replay::Missed
-    };
+    let replay = session::replay_for(switching, session.remote_in_alt_screen());
     if !session.attach_output(sink, replay) {
         // The task is gone, so the session ended while it was detached.
         return Ok(SessionOutcome::Ended(None));
