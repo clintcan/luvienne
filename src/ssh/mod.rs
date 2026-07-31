@@ -1314,7 +1314,16 @@ fn split_at_detach(bytes: &[u8]) -> Option<&[u8]> {
 /// scope.
 pub async fn attach(session: &LiveSession, switching: bool) -> Result<SessionOutcome, SshError> {
     let (sink, mut output) = tokio::sync::mpsc::unbounded_channel();
-    if !session.attach_output(sink) {
+    // Arriving from another session means this one's screen is not on the
+    // terminal at all, so its recent output has to be put back — otherwise the
+    // rule is followed by nothing until you press enter, because the remote
+    // already printed its prompt and will not print another unprompted.
+    let replay = if switching {
+        session::Replay::Recent
+    } else {
+        session::Replay::Missed
+    };
+    if !session.attach_output(sink, replay) {
         // The task is gone, so the session ended while it was detached.
         return Ok(SessionOutcome::Ended(None));
     }
