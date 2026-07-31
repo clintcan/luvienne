@@ -72,7 +72,8 @@ Both are real frames rendered by the app, with invented hosts.
   disappearing. `s` lists what is detached once you have more than a couple to
   keep track of, and `n` opens another shell on a host that already has one.
   Moving between sessions draws a rule naming the one you have arrived at and
-  puts its recent output back, since they share the terminal's scrollback.
+  puts its recent output back, since they share the terminal's scrollback. `x`
+  disconnects one outright, including a session too wedged to close politely.
 - **Quick connect** with `c` for somewhere that is not in the list — type
   `user@host:port` the way you would after `ssh`. It uses the agent, asks for a
   username if you leave one out, and is not written to the inventory. Type a name
@@ -190,6 +191,7 @@ See [`hosts.example.toml`](hosts.example.toml) for every field, commented.
 | `c` | quick connect to `user@host[:port]`, without saving it |
 | `n` | open another session to the selected host |
 | `s` | list detached sessions; `↵` resumes one, `esc` goes back |
+| `x` | disconnect a session, after confirming — works when it has stopped responding |
 | `/` | filter; `esc` clears it |
 | `t` | cycle the category filter |
 | `j` `k` or `↓` `↑` | move |

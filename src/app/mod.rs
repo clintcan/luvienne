@@ -53,6 +53,8 @@ pub enum Mode {
     SessionList,
     /// Typing an `ssh`-style target to reach once, without saving it.
     QuickConnect,
+    /// Confirming that a session should be disconnected.
+    ConfirmClose,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +75,7 @@ pub enum Action {
     ShowSessions,
     NewSession,
     QuickConnect,
+    CloseSession,
 }
 
 /// The one place key bindings are declared. Dispatch reads it and so does the
@@ -110,6 +113,15 @@ pub const BINDINGS: &[(KeyCode, &str, &str, Action)] = &[
         "c",
         "quick connect",
         Action::QuickConnect,
+    ),
+    // Not `d`: that deletes a host two rows up in this table, and muscle memory
+    // should not be able to delete an inventory entry when you meant to drop a
+    // connection.
+    (
+        KeyCode::Char('x'),
+        "x",
+        "disconnect session",
+        Action::CloseSession,
     ),
 ];
 
@@ -178,6 +190,18 @@ pub struct App {
     last_attached: Option<u64>,
     /// What has been typed into quick connect. Not a secret and not saved.
     pub quick_input: String,
+    /// The session a close is waiting on, by id.
+    ///
+    /// By id rather than index for the usual reason: a session ending while the
+    /// prompt is up shifts the rows, and confirming would then close whichever
+    /// session slid into that slot.
+    pub pending_close: Option<u64>,
+    /// Whether the close prompt was raised from the session list.
+    ///
+    /// Confirming goes back there while sessions remain: closing several is the
+    /// point of the feature, and being dumped on the host list after each one
+    /// means pressing `s` again to reach the next.
+    close_from_list: bool,
     pub tag_filter: Option<String>,
     pub status: Status,
     pub host_key_prompt: Option<PendingHostKey>,
@@ -239,6 +263,8 @@ impl App {
             session_selected: 0,
             last_attached: None,
             quick_input: String::new(),
+            pending_close: None,
+            close_from_list: false,
             tag_filter: None,
             status: Status::Idle,
             host_key_prompt: None,
@@ -421,7 +447,10 @@ impl App {
         // rather than confusion — wiping it would be gratuitous.
         let switching = self.switching_to(session.id());
         let attached_id = session.id();
-        let result = self.runtime.block_on(ssh::attach(session, switching));
+        let label = self.session_label(index);
+        let result = self
+            .runtime
+            .block_on(ssh::attach(session, switching, &label));
         self.last_attached = Some(attached_id);
 
         ui::resume()?;
@@ -550,6 +579,36 @@ impl App {
         self.sessions
             .iter()
             .position(|s| s.host == host && !s.has_ended())
+    }
+
+    /// What to call one session, in a list where a host may hold several.
+    ///
+    /// Numbered by order of opening, and only where there is something to tell
+    /// apart — a lone session should not read `web-01 #1`. Lives here rather
+    /// than in the renderer because the rule drawn on a switch has to say the
+    /// same thing the session list does; two spellings of the same session is
+    /// worse than none.
+    pub fn session_label(&self, index: usize) -> String {
+        let Some(session) = self.sessions.get(index) else {
+            return String::new();
+        };
+        let host = session.host.as_str();
+
+        // Counts every row, including one that has just ended and not yet been
+        // pruned — unlike `session_count`, which the `●` marker uses and which
+        // means "resumable". They agree in practice because `prune_dead_sessions`
+        // runs before any attach or render. Filtering here instead would number a
+        // still-listed dead row as though it were absent, colliding with the next
+        // live one.
+        let total = self.sessions.iter().filter(|s| s.host == host).count();
+        if total <= 1 {
+            return host.to_string();
+        }
+        let nth = self.sessions[..=index]
+            .iter()
+            .filter(|s| s.host == host)
+            .count();
+        format!("{host} #{nth}")
     }
 
     /// How many live sessions this host holds.
@@ -688,6 +747,12 @@ impl App {
 
             // Same rule as the host key prompt: explicit `y` only, so a delete
             // can never happen by reflex.
+            Mode::ConfirmClose => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_close(true),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.confirm_close(false),
+                _ => {}
+            },
+
             Mode::ConfirmDelete => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm_delete(true),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -787,6 +852,7 @@ impl App {
             }
 
             Mode::SessionList => match key.code {
+                KeyCode::Char('x') => self.ask_to_close(Some(self.session_selected)),
                 KeyCode::Esc => self.mode = Mode::Browse,
                 KeyCode::Enter => self.resume_selected_session(),
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -893,6 +959,13 @@ impl App {
                 self.quick_input.clear();
                 self.mode = Mode::QuickConnect;
             }
+            // From the host list this closes the host's *first* session, the
+            // same one `↵` resumes. The session list is where you pick among
+            // several.
+            Action::CloseSession => match self.selected_host().map(|h| h.name.clone()) {
+                Some(name) => self.ask_to_close(self.session_for(&name)),
+                None => self.status = Status::Error("no host selected".into()),
+            },
         }
     }
 
@@ -1008,6 +1081,71 @@ impl App {
         if self.persist(previous, format!("updated {count} hosts")) {
             self.close_form();
         }
+    }
+
+    /// Put up the close confirmation for the session at `index`.
+    ///
+    /// Confirmed because this kills a remote shell and whatever was running in
+    /// it. `q` closes everything without asking, but `q` says what it does; `x`
+    /// on a row does not.
+    fn ask_to_close(&mut self, index: Option<usize>) {
+        let Some(session) = index.and_then(|i| self.sessions.get(i)) else {
+            self.status = Status::Error("no session on that host".into());
+            return;
+        };
+        self.pending_close = Some(session.id());
+        self.close_from_list = self.mode == Mode::SessionList;
+        self.mode = Mode::ConfirmClose;
+    }
+
+    /// Disconnect the session the prompt was raised for.
+    ///
+    /// Resolved by id, not by the index the prompt was opened with: a session
+    /// ending while the prompt is up shifts the rows, and closing by position
+    /// would kill whichever one slid into that slot.
+    fn confirm_close(&mut self, confirmed: bool) {
+        let id = self.pending_close.take();
+
+        if confirmed {
+            match id.and_then(|id| self.sessions.iter().position(|s| s.id() == id)) {
+                Some(index) => {
+                    let label = self.session_label(index);
+                    self.sessions[index].disconnect();
+                    // Removed here rather than left to `prune_dead_sessions`,
+                    // which would announce it as a session that died — this one
+                    // was asked to go.
+                    self.forget_session(index);
+                    self.status = Status::Ok(format!("disconnected {label}"));
+                }
+                None => self.status = Status::Error("that session has already ended".into()),
+            }
+        }
+
+        // Back where the prompt was raised, so closing several in a row does not
+        // mean pressing `s` between each. The list is no place to be once it is
+        // empty, though.
+        self.mode = if self.close_from_list && !self.sessions.is_empty() {
+            Mode::SessionList
+        } else {
+            Mode::Browse
+        };
+    }
+
+    /// Drop a session from the list without disturbing a pending resume.
+    ///
+    /// The same hazard `prune_dead_sessions` handles: `pending_attach` is an
+    /// index, so removing a row beneath it would point it at a different
+    /// session.
+    fn forget_session(&mut self, index: usize) {
+        if let Some(pending) = self.pending_attach {
+            self.pending_attach = match pending.cmp(&index) {
+                std::cmp::Ordering::Equal => None,
+                std::cmp::Ordering::Greater => Some(pending - 1),
+                std::cmp::Ordering::Less => Some(pending),
+            };
+        }
+        self.sessions.remove(index);
+        self.clamp_session_selection();
     }
 
     fn confirm_delete(&mut self, confirmed: bool) {
@@ -2619,6 +2757,169 @@ mod tests {
         assert!(app.quick_input.is_empty());
         assert!(app.connecting.is_empty(), "dialled an empty target");
         assert_eq!(app.mode, Mode::QuickConnect, "left the prompt on an error");
+    }
+
+    /// The rule drawn on a switch and the row in the session list have to name
+    /// the session the same way, or `Ubuntu VM` three times over tells you
+    /// nothing about which one you arrived in.
+    #[test]
+    fn a_session_label_numbers_only_where_a_host_repeats() {
+        let mut app = fresh_app("labels", vec![]);
+        let (a, _ra) = ssh::LiveSession::for_test("ubuntu-vm");
+        let (b, _rb) = ssh::LiveSession::for_test("db-primary");
+        let (c, _rc) = ssh::LiveSession::for_test("ubuntu-vm");
+        app.sessions.push(a);
+        app.sessions.push(b);
+        app.sessions.push(c);
+
+        assert_eq!(app.session_label(0), "ubuntu-vm #1");
+        assert_eq!(
+            app.session_label(2),
+            "ubuntu-vm #2",
+            "numbered by order opened"
+        );
+        assert_eq!(
+            app.session_label(1),
+            "db-primary",
+            "a lone session is not numbered"
+        );
+        assert_eq!(
+            app.session_label(99),
+            "",
+            "out of range is empty, not a panic"
+        );
+    }
+
+    #[test]
+    fn x_asks_before_disconnecting_and_esc_keeps_the_session() {
+        let mut app = fresh_app("closeask", vec![host("web-01", &[])]);
+        let (session, _keep) = ssh::LiveSession::for_test("web-01");
+        app.sessions.push(session);
+
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.mode, Mode::ConfirmClose, "closed without asking");
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.sessions.len(), 1, "esc still killed the session");
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn confirming_disconnects_and_drops_the_row() {
+        let mut app = fresh_app("closedo", vec![host("web-01", &[])]);
+        let (session, _keep) = ssh::LiveSession::for_test("web-01");
+        app.sessions.push(session);
+
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert!(
+            app.sessions.is_empty(),
+            "the session outlived the disconnect"
+        );
+        assert!(
+            matches!(&app.status, Status::Ok(m) if m.contains("web-01")),
+            "should name what it closed, got {:?}",
+            app.status
+        );
+    }
+
+    /// The prompt holds an id, so a session ending underneath it must not send
+    /// the confirmation to whichever row slid into that slot.
+    #[test]
+    fn confirming_after_the_rows_shift_closes_the_right_session() {
+        let mut app = fresh_app("closeshift", vec![]);
+        let (alpha, _ka) = ssh::LiveSession::for_test("alpha");
+        let (beta, _kb) = ssh::LiveSession::for_test("beta");
+        app.sessions.push(alpha);
+        app.sessions.push(beta);
+
+        // Ask to close beta, then lose alpha before confirming.
+        app.session_selected = 1;
+        app.mode = Mode::SessionList;
+        press(&mut app, KeyCode::Char('x'));
+        app.sessions[0].mark_ended_for_test();
+        app.prune_dead_sessions();
+
+        press(&mut app, KeyCode::Char('y'));
+
+        assert!(app.sessions.is_empty(), "beta should be gone");
+    }
+
+    /// Closing a session must not misdirect a resume that is already pending,
+    /// the same hazard `prune_dead_sessions` handles.
+    #[test]
+    fn closing_a_session_keeps_a_pending_resume_pointed_at_its_own() {
+        let mut app = fresh_app("closepending", vec![]);
+        for host in ["alpha", "beta", "gamma"] {
+            let (session, keep) = ssh::LiveSession::for_test(host);
+            app.sessions.push(session);
+            std::mem::forget(keep);
+        }
+        app.pending_attach = Some(2); // gamma
+
+        app.forget_session(0); // alpha goes
+
+        assert_eq!(
+            app.pending_attach,
+            Some(1),
+            "the resume should follow gamma"
+        );
+        assert_eq!(app.sessions[1].host, "gamma");
+    }
+
+    /// Closing several is the point, so the prompt returns you to the list you
+    /// raised it from — until there is nothing left to return to.
+    #[test]
+    fn closing_from_the_list_goes_back_to_the_list() {
+        let mut app = fresh_app("closeback", vec![]);
+        let (a, _ka) = ssh::LiveSession::for_test("alpha");
+        let (b, _kb) = ssh::LiveSession::for_test("beta");
+        app.sessions.push(a);
+        app.sessions.push(b);
+        app.mode = Mode::SessionList;
+
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(
+            app.mode,
+            Mode::SessionList,
+            "bounced out with one still open"
+        );
+        assert_eq!(app.sessions.len(), 1);
+
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.mode, Mode::Browse, "stayed in an empty list");
+        assert!(app.sessions.is_empty());
+    }
+
+    /// Cancelling returns you where you were too, rather than to the host list.
+    #[test]
+    fn cancelling_a_close_from_the_list_stays_in_the_list() {
+        let mut app = fresh_app("closecancel", vec![]);
+        let (a, _ka) = ssh::LiveSession::for_test("alpha");
+        app.sessions.push(a);
+        app.mode = Mode::SessionList;
+
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Esc);
+
+        assert_eq!(app.mode, Mode::SessionList);
+        assert_eq!(app.sessions.len(), 1, "esc killed the session");
+    }
+
+    /// From the host list it behaves the other way: there is no list to go back to.
+    #[test]
+    fn closing_from_the_host_list_stays_on_the_host_list() {
+        let mut app = fresh_app("closehostlist", vec![host("web-01", &[])]);
+        let (session, _keep) = ssh::LiveSession::for_test("web-01");
+        app.sessions.push(session);
+
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_eq!(app.mode, Mode::Browse);
     }
 
     /// `↵` on a connected host must keep resuming. If it opened a second shell

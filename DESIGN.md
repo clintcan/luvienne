@@ -170,6 +170,24 @@ real bell. Trimming the tail cuts forward to the next newline so a replay does
 not start mid-sequence, which is an approximation: the guarantee would be a grid,
 and that is a terminal emulator.
 
+**`x` disconnects a session, and means it** (`LiveSession::disconnect`).
+`Command::Close` is polite and needs the session's task loop to be turning, so a
+task blocked inside an await — the far end stopped reading — never sees it. Those
+are exactly the sessions someone wants gone, so `disconnect` asks politely and
+then aborts the task regardless: that drops the transport handles and the
+`AbortOnDrop` forward guard it owns, tearing down the connection and its
+listeners whatever it was waiting on. `ended` is set here rather than left to the
+task, which by then may never run again.
+
+The prompt holds a session *id*, not an index: a session ending while it is up
+shifts the rows, and confirming by position would close whichever one slid into
+that slot. Removal goes through `forget_session`, which remaps `pending_attach`
+for the same reason `prune_dead_sessions` does, and the session is taken out of
+the list directly rather than left to prune — prune would announce it as a
+session that *died*, and this one was asked to go. Confirming returns to the
+session list while sessions remain, because closing several in a row is the
+point.
+
 **Quitting wipes the screen it hands back** (`ui::clear_handed_back_screen`), but
 only when a session ran. An alternate-screen app is expected to leave no trace,
 and sessions are the one trace luvienne makes: they draw on the *primary* screen,

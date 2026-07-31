@@ -1272,6 +1272,10 @@ async fn write_session_output(
 
 /// A rule naming the session the terminal has just been handed to.
 ///
+/// `label` rather than the host, because a host may hold several sessions and
+/// `Ubuntu VM` three times over does not say which one you have arrived in. It
+/// is the same string the session list shows, so the two agree.
+///
 /// CRLF at both ends because the terminal is in raw mode, and dim so it reads as
 /// ours rather than as something the remote printed. Falls back to 80 columns if
 /// the size cannot be read — a short rule is a cosmetic loss, and refusing to
@@ -1312,7 +1316,11 @@ fn split_at_detach(bytes: &[u8]) -> Option<&[u8]> {
 /// Do not parse the byte stream, beyond looking for [`DETACH_KEY`]. Anything
 /// more is the first step toward writing a terminal emulator, which is out of
 /// scope.
-pub async fn attach(session: &LiveSession, switching: bool) -> Result<SessionOutcome, SshError> {
+pub async fn attach(
+    session: &LiveSession,
+    switching: bool,
+    label: &str,
+) -> Result<SessionOutcome, SshError> {
     let (sink, mut output) = tokio::sync::mpsc::unbounded_channel();
     // Arriving from another session means this one's screen is not on the
     // terminal at all, so its recent output has to be put back — otherwise the
@@ -1339,7 +1347,7 @@ pub async fn attach(session: &LiveSession, switching: bool) -> Result<SessionOut
     // nudge below, and a line of ours in the middle of its display would corrupt
     // it — the same reason the detach banner is first-attach only.
     if switching && !session.remote_in_alt_screen() {
-        write_session_output(&mut stdout, &switch_rule(&session.host)).await?;
+        write_session_output(&mut stdout, &switch_rule(label)).await?;
     }
 
     if resuming {

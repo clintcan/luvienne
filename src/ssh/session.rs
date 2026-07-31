@@ -215,6 +215,15 @@ pub struct LiveSession {
     remote_alt: Arc<AtomicBool>,
     /// Cleared after the first attach, so only a *re*-attach forces a repaint.
     first_attach: Arc<AtomicBool>,
+    /// Kept so a wedged session can be killed outright. `Command::Close` is
+    /// polite and needs the task's loop to be turning; a task blocked inside an
+    /// await — the far end stopped reading, say — never sees it. Aborting drops
+    /// the transport handles the task owns, which tears the connection down
+    /// whatever it was waiting on.
+    ///
+    /// `Option` for the test constructor, which has no runtime to spawn on and
+    /// no connection to tear down.
+    task: Option<tokio::task::JoinHandle<()>>,
     /// Forwards the session asked for and did not get, kept so the failure can
     /// be shown after the connect status has been replaced.
     forward_failures: Vec<String>,
@@ -246,7 +255,7 @@ impl LiveSession {
         let ended = Arc::new(AtomicBool::new(false));
         let remote_alt = Arc::new(AtomicBool::new(false));
         let forward_failures = forwards.failures;
-        tokio::spawn(run(
+        let task = tokio::spawn(run(
             transports,
             channel,
             rx,
@@ -261,6 +270,7 @@ impl LiveSession {
             ended,
             remote_alt,
             first_attach: Arc::new(AtomicBool::new(true)),
+            task: Some(task),
             forward_failures,
         }
     }
@@ -322,6 +332,23 @@ impl LiveSession {
     pub fn close(&self) {
         self.send(Command::Close);
     }
+
+    /// Close a session and make sure it is gone.
+    ///
+    /// Asks politely first, so a responsive session closes its channel cleanly
+    /// and the server sees a normal disconnect. Then aborts regardless: this is
+    /// reached because the user wants the session gone, and the sessions people
+    /// want gone are exactly the ones too wedged to answer.
+    ///
+    /// `ended` is set here rather than left to the task, which by then may never
+    /// run again — otherwise the session would linger in the list looking alive.
+    pub fn disconnect(&self) {
+        self.send(Command::Close);
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+        self.ended.store(true, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +363,9 @@ impl LiveSession {
         (
             Self {
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                // No task: the tests never run a real session, and spawning one
+                // here would need a runtime in context that they do not have.
+                task: None,
                 host: host.into(),
                 commands,
                 ended: Arc::new(AtomicBool::new(false)),

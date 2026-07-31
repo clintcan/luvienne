@@ -152,6 +152,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::Secret => render_secret_prompt(app, &theme, frame, area),
         Mode::Form => render_form(app, &theme, frame, area),
         Mode::ConfirmDelete => render_delete_prompt(app, &theme, frame, area),
+        Mode::ConfirmClose => render_close_prompt(app, &theme, frame, area),
         Mode::FilePicker => render_picker(app, &theme, frame, area),
         Mode::ConfirmImport => render_import_prompt(app, &theme, frame, area),
         _ => {}
@@ -515,6 +516,44 @@ fn render_form(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 
 /// Delete confirmation. Names the host, because "are you sure?" is not enough
 /// information to answer safely.
+/// Confirm disconnecting a session.
+///
+/// Names the session the way the list and the switch rule do, so a host with
+/// several open shells says *which* one is about to go.
+fn render_close_prompt(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+    let label = app
+        .pending_close
+        .and_then(|id| app.sessions.iter().position(|s| s.id() == id))
+        .map(|index| app.session_label(index))
+        .unwrap_or_else(|| "this session".to_string());
+
+    let width = 60u16.min(area.width.saturating_sub(4));
+    let height = 5u16.min(area.height);
+    let popup = centered(width, height, area);
+
+    let body = vec![
+        Line::from(Span::styled(format!("  Disconnect {label}?"), theme.base())),
+        Line::from(Span::styled(
+            "  The remote shell and anything running in it are killed.",
+            theme.dimmed(),
+        )),
+        Line::from(vec![
+            Span::styled("  y", theme.key_hint()),
+            Span::styled(" disconnect    ", theme.dimmed()),
+            Span::styled("n/esc", theme.key_hint()),
+            Span::styled(" keep", theme.dimmed()),
+        ]),
+    ];
+
+    let block = Block::bordered()
+        .border_type(theme.border)
+        .border_style(theme.warn_style())
+        .title(Span::styled(" confirm disconnect ", theme.warn_style()));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(body).block(block), popup);
+}
+
 fn render_delete_prompt(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let name = app
         .pending_delete
@@ -697,7 +736,7 @@ fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
             Span::styled("▌", theme.key_hint()),
         ]),
         Mode::SessionList => Line::from(vec![Span::styled(
-            "  ↵ resume session   esc back to hosts",
+            "  ↵ resume session   x disconnect   esc back to hosts",
             theme.dimmed(),
         )]),
         // The label stays visible while typing: the whole point of this prompt is
@@ -898,40 +937,15 @@ fn name_column_width(longest_name: usize) -> u16 {
         .max(FLOOR)
 }
 
-/// One label per session, in `app.sessions` order.
-///
-/// A host can hold several sessions now, and two rows reading `web-01` are a
-/// list you cannot act on. Numbered by order of opening, and only where there is
-/// something to tell apart — a lone session should not read `web-01 #1`.
-fn session_labels(app: &App) -> Vec<String> {
-    let mut totals: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for session in &app.sessions {
-        *totals.entry(session.host.as_str()).or_default() += 1;
-    }
-
-    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    app.sessions
-        .iter()
-        .map(|session| {
-            let host = session.host.as_str();
-            let nth = seen.entry(host).or_default();
-            *nth += 1;
-            if totals[host] > 1 {
-                format!("{host} #{nth}")
-            } else {
-                host.to_string()
-            }
-        })
-        .collect()
-}
-
 fn render_sessions(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let viewport = area.height.saturating_sub(3) as usize;
     let offset = app
         .session_selected
         .saturating_sub(viewport.saturating_sub(1));
 
-    let labels = session_labels(app);
+    let labels: Vec<String> = (0..app.sessions.len())
+        .map(|i| app.session_label(i))
+        .collect();
 
     let rows: Vec<Row> = app
         .sessions
