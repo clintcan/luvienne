@@ -164,11 +164,22 @@ fn main() -> Result<()> {
     if let Some(name) = &target {
         app.connect_to(name);
     }
-    let result = app.run(&mut terminal);
+    let outcome = app.run(&mut terminal);
 
     ratatui::restore();
     // `ratatui::restore` leaves the cursor hidden and the title ours.
     let _ = ui::show_cursor();
     let _ = ui::pop_title();
-    result
+
+    // Sessions draw on the primary screen, so quitting after using one leaves
+    // the remote's output behind rather than the shell the user started from.
+    // Clearing it is the last part of leaving no trace — and it is skipped when
+    // no session ran, because then the screen is theirs and not ours to wipe.
+    if let Ok(outcome) = &outcome
+        && outcome.wrote_to_the_screen
+    {
+        let _ = ui::clear_handed_back_screen();
+    }
+
+    outcome.map(|_| ())
 }

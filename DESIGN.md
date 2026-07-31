@@ -152,6 +152,15 @@ ours would.
 `LiveSession` carries an id for the switching test, because position in
 `App::sessions` shifts as sessions end.
 
+**Quitting wipes the screen it hands back** (`ui::clear_handed_back_screen`), but
+only when a session ran. An alternate-screen app is expected to leave no trace,
+and sessions are the one trace luvienne makes: they draw on the *primary* screen,
+so quitting after using one dropped the user into the remote's leftovers instead
+of the shell they started from. `App::run` returns an `Outcome` saying whether a
+session ever held the terminal, because the tidying has to happen after ratatui
+has left the alternate screen and there is no `App` by then. A browse-only run
+clears nothing — that text is the user's own.
+
 **Restoring the terminal resets its colour** (`ui::resume`). `Theme::base` sets no
 background so the terminal's own theme and transparency show through, which means
 every cell we draw inherits the SGR state we are handed back. A remote program

@@ -212,6 +212,17 @@ pub struct App {
     rx: UnboundedReceiver<SshEvent>,
 }
 
+/// What a run left for `main` to tidy up.
+///
+/// Returned rather than queried because `run` consumes the app, and the tidying
+/// has to happen *after* ratatui has left the alternate screen — there is no
+/// `App` left by then.
+pub struct Outcome {
+    /// Whether any session took over the primary screen and left output on it.
+    /// False for a browse-only run, which leaves no trace to clean up.
+    pub wrote_to_the_screen: bool,
+}
+
 impl App {
     pub fn new(
         inventory: Inventory,
@@ -247,7 +258,7 @@ impl App {
         }
     }
 
-    pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+    pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<Outcome> {
         // Redraw only when something actually changed. Painting every pass
         // costs a few percent of a core around the clock for a UI that is
         // usually just sitting there, and this app is meant to stay open.
@@ -285,7 +296,12 @@ impl App {
                 }
             }
         }
-        Ok(())
+        Ok(Outcome {
+            // `last_attached` is set by every attach and never cleared, so it is
+            // exactly the question being asked: did a session ever hold the
+            // primary screen?
+            wrote_to_the_screen: self.last_attached.is_some(),
+        })
     }
 
     /// Positions in `inventory.hosts` of the hosts currently shown.

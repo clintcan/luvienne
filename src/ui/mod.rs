@@ -6,10 +6,14 @@
 pub mod theme;
 
 use ratatui::Frame;
+use ratatui::crossterm::cursor::MoveTo;
 use ratatui::crossterm::cursor::{Hide, Show};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::style::ResetColor;
-use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, SetTitle};
+// Aliased: ratatui has a `Clear` *widget* too, and the two are unrelated.
+use ratatui::crossterm::terminal::{
+    Clear as ClearTerminal, ClearType, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+};
 use std::io::Write;
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -59,6 +63,25 @@ fn suspend_to(out: &mut impl Write) -> std::io::Result<()> {
 
 fn resume_to(out: &mut impl Write) -> std::io::Result<()> {
     execute!(out, EnterAlternateScreen, ResetColor, Hide)
+}
+
+/// Wipe the screen luvienne is handing back on the way out.
+///
+/// Sessions run on the *primary* screen — that is the whole point of suspending
+/// ratatui rather than drawing them — so quitting drops the user back into the
+/// leftovers of everything they connected to, rather than the shell they
+/// started from. An alternate-screen app is expected to leave no trace, and this
+/// is the only part of the trace luvienne makes.
+///
+/// Only called when a session actually took the terminal. With no session, the
+/// text on that screen is the user's own and wiping it would be gratuitous —
+/// the same rule the switch rule follows.
+pub fn clear_handed_back_screen() -> std::io::Result<()> {
+    execute!(
+        std::io::stdout(),
+        ClearTerminal(ClearType::All),
+        MoveTo(0, 0)
+    )
 }
 
 /// The window title while browsing.
