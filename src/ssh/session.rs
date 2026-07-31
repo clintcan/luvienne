@@ -24,6 +24,18 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 /// what you want on return.
 const BACKLOG_LIMIT: usize = 256 * 1024;
 
+/// How much recent output each session keeps for a *switch*.
+///
+/// Different from the backlog, which holds only what arrived while detached and
+/// is replayed on any attach. This is kept all the time, so that arriving from
+/// another session lands on the shell's recent context rather than a blank space
+/// below the rule: the remote already printed its prompt and will not print
+/// another until a command finishes, so nothing else can put it back.
+///
+/// A screenful and a bit. Larger only costs memory; smaller starts cutting the
+/// prompt off the top of what is replayed.
+const TAIL_LIMIT: usize = 16 * 1024;
+
 /// Handed out to distinguish one session from another.
 ///
 /// Position in `App::sessions` cannot do it: rows shift as sessions end, and the
@@ -46,6 +58,17 @@ pub enum Output {
     Ended(Option<u32>),
 }
 
+/// What an attach wants replayed onto the screen it is landing on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replay {
+    /// Coming back to this session's own screen: only what it missed. The rest
+    /// is already on the terminal, and re-sending it would print it twice.
+    Missed,
+    /// Arriving from a different session, below a rule, with this session's
+    /// screen nowhere in sight. Replay its recent output so the prompt is there.
+    Recent,
+}
+
 pub(crate) enum Command {
     Input(Vec<u8>),
     Resize {
@@ -55,7 +78,7 @@ pub(crate) enum Command {
         ypix: u32,
     },
     /// Start forwarding output here, beginning with anything buffered.
-    Attach(UnboundedSender<Output>),
+    Attach(UnboundedSender<Output>, Replay),
     /// Stop forwarding; buffer instead.
     Detach,
     Close,
@@ -237,8 +260,8 @@ impl LiveSession {
         self.commands.send(command).is_ok()
     }
 
-    pub(super) fn attach_output(&self, sink: UnboundedSender<Output>) -> bool {
-        self.send(Command::Attach(sink))
+    pub(super) fn attach_output(&self, sink: UnboundedSender<Output>, replay: Replay) -> bool {
+        self.send(Command::Attach(sink, replay))
     }
 
     pub(super) fn detach_output(&self) -> bool {
@@ -293,6 +316,69 @@ impl LiveSession {
     }
 }
 
+/// Strip the sequences that *do* something, leaving the ones that draw.
+///
+/// A replay is a repaint, and a repaint must not re-run side effects. Raw bytes
+/// re-run all of them: every prompt a real shell draws usually carries an OSC
+/// title sequence terminated by `BEL`, so a tail holding a dozen prompts rings
+/// the bell a dozen times — and OSC 52 would rewrite the clipboard. Titles are
+/// ours anyway (`ui::set_title`), and a bell about something that happened
+/// minutes ago is noise.
+///
+/// Only OSC and bare `BEL` are removed. CSI sequences are what paint the screen,
+/// so they stay — which is also why this cannot be a blanket filter.
+fn strip_side_effects(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // OSC: ESC ] … terminated by BEL or ST (ESC \).
+        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b']') {
+            let mut j = i + 2;
+            while j < bytes.len() {
+                if bytes[j] == 0x07 {
+                    j += 1;
+                    break;
+                }
+                if bytes[j] == 0x1b && bytes.get(j + 1) == Some(&b'\\') {
+                    j += 2;
+                    break;
+                }
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+        // A bell on its own: whatever rang it is long past.
+        if bytes[i] == 0x07 {
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Keep the tail trimmed to [`TAIL_LIMIT`], cutting at a line boundary.
+///
+/// Cutting mid-escape would replay half a control sequence and paint garbage.
+/// A newline is not a guarantee — a sequence *can* span one — but escapes
+/// overwhelmingly do not, and this is the cheap approximation. A grid would be
+/// the guarantee, and that is a terminal emulator.
+fn push_tail(tail: &mut VecDeque<u8>, data: &[u8]) {
+    tail.extend(data.iter().copied());
+    if tail.len() <= TAIL_LIMIT {
+        return;
+    }
+    let excess = tail.len() - TAIL_LIMIT;
+    tail.drain(..excess);
+    // Then forward to just past the next newline, so the replay starts on a
+    // fresh line rather than mid-sequence.
+    if let Some(nl) = tail.iter().position(|b| *b == b'\n') {
+        tail.drain(..=nl);
+    }
+}
+
 fn push_backlog(backlog: &mut VecDeque<u8>, data: &[u8]) {
     backlog.extend(data.iter().copied());
     // Drop from the front: the tail is the part worth showing on return.
@@ -323,6 +409,7 @@ async fn run(
     let mut channel = channel;
     let mut consumer: Option<UnboundedSender<Output>> = None;
     let mut backlog: VecDeque<u8> = VecDeque::new();
+    let mut tail: VecDeque<u8> = VecDeque::new();
     let mut exit_status = None;
 
     loop {
@@ -341,12 +428,25 @@ async fn run(
                     // A resize failing is not worth ending a session over.
                     let _ = channel.window_change(cols, rows, xpix, ypix).await;
                 }
-                Some(Command::Attach(sink)) => {
-                    if !backlog.is_empty() {
-                        let buffered: Vec<u8> = backlog.drain(..).collect();
-                        if sink.send(Output::Bytes(buffered)).is_err() {
-                            continue;
+                Some(Command::Attach(sink, replay)) => {
+                    // `Recent` supersedes the backlog: the tail already contains
+                    // everything the backlog does, so sending both would print
+                    // the missed output twice.
+                    let bytes: Vec<u8> = match replay {
+                        // Repainting old output must not ring old bells or set
+                        // titles and clipboards a second time.
+                        Replay::Recent => {
+                            strip_side_effects(&tail.iter().copied().collect::<Vec<_>>())
                         }
+                        // Not stripped: this is output arriving for the first
+                        // time, merely late. A bell in it is a real bell.
+                        Replay::Missed => backlog.drain(..).collect(),
+                    };
+                    if replay == Replay::Recent {
+                        backlog.clear();
+                    }
+                    if !bytes.is_empty() && sink.send(Output::Bytes(bytes)).is_err() {
+                        continue;
                     }
                     consumer = Some(sink);
                 }
@@ -358,6 +458,7 @@ async fn run(
                     if let Some(in_alt) = alt_tracker.observe(&data) {
                         remote_alt.store(in_alt, Ordering::Relaxed);
                     }
+                    push_tail(&mut tail, &data);
                     match &consumer {
                         Some(sink) => {
                             if sink.send(Output::Bytes(data.to_vec())).is_err() {
@@ -386,6 +487,34 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A repaint must not re-run what the bytes originally *did*. Real prompts
+    /// carry an OSC title sequence ending in BEL, so a tail of a dozen prompts
+    /// rang the bell a dozen times on every switch.
+    #[test]
+    fn a_replay_paints_without_ringing_or_setting_titles() {
+        let prompt = b"\x1b]0;tester@host: ~\x07user@host:~$ ";
+        let stripped = strip_side_effects(prompt);
+
+        assert_eq!(stripped, b"user@host:~$ ", "the title sequence survived");
+        assert!(!stripped.contains(&0x07), "a bell survived");
+    }
+
+    /// OSC terminated by ST rather than BEL, and a bare bell on its own.
+    #[test]
+    fn both_osc_terminators_and_lone_bells_are_removed() {
+        assert_eq!(strip_side_effects(b"a\x1b]52;c;Zm9v\x1b\\b"), b"ab");
+        assert_eq!(strip_side_effects(b"ding\x07dong"), b"dingdong");
+    }
+
+    /// The sequences that *draw* have to survive, or the replay repaints nothing.
+    #[test]
+    fn colour_and_cursor_sequences_survive_the_strip() {
+        let painted = b"\x1b[1;32mgreen\x1b[0m\x1b[2Kline\r\n";
+        assert_eq!(strip_side_effects(painted), painted);
+    }
+
     use super::*;
 
     #[test]
