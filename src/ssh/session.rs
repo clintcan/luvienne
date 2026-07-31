@@ -515,7 +515,24 @@ mod tests {
         assert_eq!(strip_side_effects(painted), painted);
     }
 
-    use super::*;
+    /// The tail is capped, and a trim starts on a fresh line — cutting mid-escape
+    /// would replay half a control sequence and paint garbage.
+    #[test]
+    fn the_tail_is_capped_and_trimmed_to_a_line_boundary() {
+        let mut tail = VecDeque::new();
+        for i in 0..(TAIL_LIMIT * 2 / 8) {
+            push_tail(&mut tail, format!("{i:07}\n").as_bytes());
+        }
+
+        assert!(tail.len() <= TAIL_LIMIT, "the cap did not hold");
+        let text: Vec<u8> = tail.iter().copied().collect();
+        assert!(
+            !text.starts_with(b"\n") && text.contains(&b'\n'),
+            "the trim did not land on a line boundary"
+        );
+        // The end is what matters: it is the most recent output.
+        assert!(text.ends_with(b"\n"), "lost the end of the tail");
+    }
 
     #[test]
     fn backlog_keeps_the_tail_and_drops_the_middle() {

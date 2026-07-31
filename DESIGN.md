@@ -152,6 +152,24 @@ ours would.
 `LiveSession` carries an id for the switching test, because position in
 `App::sessions` shifts as sessions end.
 
+**Switching replays the session's recent output** (`session::Replay`). The rule
+alone left you below it with nothing: the remote had already printed its prompt
+and prints another only when a command finishes, and the backlog holds just what
+arrived while detached — nothing at all for an idle session. Each session keeps a
+16KB tail of everything it has written, and an attach says which replay it wants:
+`Recent` when arriving from a different session, whose screen is nowhere on the
+terminal, and `Missed` when returning to its own, where re-sending what is
+already displayed would print it twice.
+
+`Recent` is stripped of OSC sequences and bare bells first. **A repaint must not
+re-run what the bytes originally did**: a real shell prompt carries an OSC title
+terminated by `BEL`, so a tail of a dozen prompts rang the bell a dozen times,
+and `OSC 52` would have rewritten the clipboard. `Missed` is *not* stripped —
+that output is arriving for the first time, merely late, and a bell in it is a
+real bell. Trimming the tail cuts forward to the next newline so a replay does
+not start mid-sequence, which is an approximation: the guarantee would be a grid,
+and that is a terminal emulator.
+
 **Quitting wipes the screen it hands back** (`ui::clear_handed_back_screen`), but
 only when a session ran. An alternate-screen app is expected to leave no trace,
 and sessions are the one trace luvienne makes: they draw on the *primary* screen,
