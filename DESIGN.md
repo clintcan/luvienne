@@ -188,6 +188,20 @@ session that *died*, and this one was asked to go. Confirming returns to the
 session list while sessions remain, because closing several in a row is the
 point.
 
+**One caret implementation, not three** (`app::input`). The host form, the filter
+and quick connect each began as "push a character, pop from the end", and each
+would otherwise have grown its own caret. The shared module counts in characters
+rather than bytes — a caret between `é` and the next letter is one position — and
+clamps on every operation, because values do get replaced wholesale: a file
+picker returning a path, an input cleared on the way out.
+
+That clamping is the lesson from the first attempt. The form kept its focus index
+public, tests set it directly, and the caret stayed pointing into the field they
+had just left; two tests failed for that reason before `focus` was made private.
+Every path that empties an input has to reset its caret with it — one of them
+returned early on a saved-host match and did not, which is what the test named
+after it now pins.
+
 **Quitting wipes the screen it hands back** (`ui::clear_handed_back_screen`), but
 only when a session ran. An alternate-screen app is expected to leave no trace,
 and sessions are the one trace luvienne makes: they draw on the *primary* screen,

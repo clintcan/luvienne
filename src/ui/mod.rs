@@ -759,14 +759,19 @@ fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let content = match app.mode {
         // Same rule again: the end of the filter is what you are typing, and
         // the caret has to stay on the row.
-        Mode::Filter => Line::from(vec![
-            Span::styled("  /", theme.key_hint()),
-            Span::styled(
-                visible_tail(&app.filter, (area.width as usize).saturating_sub(2 + 3 + 1)),
-                theme.base(),
-            ),
-            Span::styled("▌", theme.key_hint()),
-        ]),
+        Mode::Filter => {
+            let (before, after) = split_at_caret(
+                &app.filter,
+                app.filter_cursor,
+                (area.width as usize).saturating_sub(2 + 3),
+            );
+            Line::from(vec![
+                Span::styled("  /", theme.key_hint()),
+                Span::styled(before, theme.base()),
+                Span::styled("▌", theme.key_hint()),
+                Span::styled(after, theme.base()),
+            ])
+        }
         Mode::SessionList => Line::from(vec![Span::styled(
             "  ↵ resume session   x disconnect   esc back to hosts",
             theme.dimmed(),
@@ -788,10 +793,12 @@ fn render_header(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
             let hint = inner >= LABEL.len() + HINT.len() + ROOM_TO_TYPE;
             let room = inner.saturating_sub(LABEL.len() + 1 + if hint { HINT.len() } else { 0 });
 
+            let (before, after) = split_at_caret(&app.quick_input, app.quick_cursor, room + 1);
             let mut spans = vec![
                 Span::styled(LABEL, theme.key_hint()),
-                Span::styled(visible_tail(&app.quick_input, room), theme.base()),
+                Span::styled(before, theme.base()),
                 Span::styled("▌", theme.key_hint()),
+                Span::styled(after, theme.base()),
             ];
             if hint {
                 spans.push(Span::styled(HINT, theme.dimmed()));
@@ -1405,6 +1412,9 @@ mod tests {
             app.mode = Mode::QuickConnect;
             app.quick_input =
                 "deploy@some.very.long.hostname.inside.a.corporate.domain.example.net:2222".into();
+            // Where typing leaves it. The window follows the caret now, so the
+            // end is only what you see when the caret is there.
+            app.quick_cursor = app.quick_input.chars().count();
 
             let out = draw(&app, width, 20);
             let header = out
@@ -1420,6 +1430,20 @@ mod tests {
             assert!(
                 header.contains(":2222"),
                 "at width {width} the end of the target is not shown:\n{header}"
+            );
+
+            // And with the caret sent home, the *start* is what has to be shown
+            // — otherwise you cannot see what you are about to edit.
+            app.quick_cursor = 0;
+            let out = draw(&app, width, 20);
+            let header = out
+                .lines()
+                .find(|l| l.contains("connect to"))
+                .unwrap_or("<no header>")
+                .to_string();
+            assert!(
+                header.contains("deploy@"),
+                "at width {width} home does not show the start:\n{header}"
             );
         }
     }

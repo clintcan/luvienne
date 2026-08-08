@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use crate::app::input;
 use crate::config::{AuthRef, Forward, Host};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -296,22 +297,17 @@ impl HostForm {
     }
 
     pub fn cursor_left(&mut self) {
-        self.cursor = self.cursor().saturating_sub(1);
+        let value = self.value(self.focused()).to_string();
+        input::left(&value, &mut self.cursor);
     }
 
     pub fn cursor_right(&mut self) {
-        self.cursor = (self.cursor() + 1).min(self.focused_len());
+        let value = self.value(self.focused()).to_string();
+        input::right(&value, &mut self.cursor);
     }
 
     pub fn cursor_home(&mut self) {
         self.cursor = 0;
-    }
-
-    /// Byte offset of a character index, for `String` operations.
-    fn byte_at(text: &str, chars: usize) -> usize {
-        text.char_indices()
-            .nth(chars)
-            .map_or(text.len(), |(byte, _)| byte)
     }
 
     /// Delete the character *at* the cursor, leaving the cursor where it is.
@@ -320,10 +316,7 @@ impl HostForm {
         let at = self.cursor();
         self.touched.insert(field);
         if let Some(buffer) = self.value_mut(field) {
-            let byte = Self::byte_at(buffer, at);
-            if byte < buffer.len() {
-                buffer.remove(byte);
-            }
+            input::delete(buffer, at);
         }
     }
 
@@ -360,27 +353,25 @@ impl HostForm {
         if field == Field::Port && !c.is_ascii_digit() {
             return;
         }
-        let at = self.cursor();
+        let mut at = self.cursor();
         self.touched.insert(field);
         if let Some(buffer) = self.value_mut(field) {
-            let byte = Self::byte_at(buffer, at);
-            buffer.insert(byte, c);
+            input::insert(buffer, &mut at, c);
         }
-        self.cursor = at + 1;
+        self.cursor = at;
     }
 
     pub fn backspace(&mut self) {
         let field = self.focused();
-        let at = self.cursor();
+        let mut at = self.cursor();
         if at == 0 {
             return;
         }
         self.touched.insert(field);
         if let Some(buffer) = self.value_mut(field) {
-            let byte = Self::byte_at(buffer, at - 1);
-            buffer.remove(byte);
+            input::backspace(buffer, &mut at);
         }
-        self.cursor = at - 1;
+        self.cursor = at;
     }
 
     /// Apply only the touched fields to an existing host.

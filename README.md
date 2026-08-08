@@ -65,6 +65,8 @@ Both are real frames rendered by the app, with invented hosts.
 
 - **Categories are tags, not a tree.** A host can be in `prod` and `db` at once.
 - **Fuzzy filter** over name, address, user, tags and auth method — `/` then type.
+  It, quick connect and the host form all edit in place: `←`/`→`, `home`/`end`
+  and `delete` work where you would expect them to.
 - **Sessions outlive an attach.** `Ctrl-]` detaches and leaves the remote shell
   running; resume it later, including into full-screen programs like `vim` or
   `mc`. Idle connections are probed so a session that has quietly died is never

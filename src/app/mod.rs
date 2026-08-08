@@ -6,6 +6,7 @@
 //! on the tokio runtime and reports back through [`SshEvent`].
 
 pub mod form;
+pub mod input;
 pub mod picker;
 
 use std::collections::HashMap;
@@ -190,6 +191,12 @@ pub struct App {
     last_attached: Option<u64>,
     /// What has been typed into quick connect. Not a secret and not saved.
     pub quick_input: String,
+    /// Caret positions for the two single-line inputs, in characters.
+    ///
+    /// Clamped on every use, so a value replaced wholesale — or assigned by a
+    /// test — cannot strand them past the end.
+    pub filter_cursor: usize,
+    pub quick_cursor: usize,
     /// The session a close is waiting on, by id.
     ///
     /// By id rather than index for the usual reason: a session ending while the
@@ -263,6 +270,8 @@ impl App {
             session_selected: 0,
             last_attached: None,
             quick_input: String::new(),
+            filter_cursor: 0,
+            quick_cursor: 0,
             pending_close: None,
             close_from_list: false,
             tag_filter: None,
@@ -698,15 +707,24 @@ impl App {
             Mode::Filter => match key.code {
                 KeyCode::Esc => {
                     self.filter.clear();
+                    self.filter_cursor = 0;
                     self.mode = Mode::Browse;
                 }
                 KeyCode::Enter => self.mode = Mode::Browse,
+                KeyCode::Left => input::left(&self.filter, &mut self.filter_cursor),
+                KeyCode::Right => input::right(&self.filter, &mut self.filter_cursor),
+                KeyCode::Home => self.filter_cursor = 0,
+                KeyCode::End => self.filter_cursor = input::end(&self.filter),
+                KeyCode::Delete => {
+                    input::delete(&mut self.filter, self.filter_cursor);
+                    self.clamp_selection();
+                }
                 KeyCode::Backspace => {
-                    self.filter.pop();
+                    input::backspace(&mut self.filter, &mut self.filter_cursor);
                     self.clamp_selection();
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.filter.push(c);
+                    input::insert(&mut self.filter, &mut self.filter_cursor, c);
                     self.clamp_selection();
                 }
                 _ => {}
@@ -896,14 +914,20 @@ impl App {
             Mode::QuickConnect => match key.code {
                 KeyCode::Esc => {
                     self.quick_input.clear();
+                    self.quick_cursor = 0;
                     self.mode = Mode::Browse;
                 }
                 KeyCode::Enter => self.connect_typed_target(),
+                KeyCode::Left => input::left(&self.quick_input, &mut self.quick_cursor),
+                KeyCode::Right => input::right(&self.quick_input, &mut self.quick_cursor),
+                KeyCode::Home => self.quick_cursor = 0,
+                KeyCode::End => self.quick_cursor = input::end(&self.quick_input),
+                KeyCode::Delete => input::delete(&mut self.quick_input, self.quick_cursor),
                 KeyCode::Backspace => {
-                    self.quick_input.pop();
+                    input::backspace(&mut self.quick_input, &mut self.quick_cursor)
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.quick_input.push(c);
+                    input::insert(&mut self.quick_input, &mut self.quick_cursor, c)
                 }
                 _ => {}
             },
@@ -936,7 +960,10 @@ impl App {
                 let last = self.visible().len().saturating_sub(1);
                 self.selected = (self.selected + 1).min(last);
             }
-            Action::StartFilter => self.mode = Mode::Filter,
+            Action::StartFilter => {
+                self.filter_cursor = input::end(&self.filter);
+                self.mode = Mode::Filter;
+            }
             Action::ClearFilter => {
                 // Esc means "stop what is happening". A connect that is going
                 // nowhere is the more urgent thing to stop, so it wins over
@@ -945,6 +972,7 @@ impl App {
                     return;
                 }
                 self.filter.clear();
+                self.filter_cursor = 0;
                 self.tag_filter = None;
                 self.clamp_selection();
             }
@@ -986,6 +1014,7 @@ impl App {
             Action::NewSession => self.open_new_session(),
             Action::QuickConnect => {
                 self.quick_input.clear();
+                self.quick_cursor = 0;
                 self.mode = Mode::QuickConnect;
             }
             // From the host list this closes the host's *first* session, the
@@ -1349,6 +1378,7 @@ impl App {
             .cloned()
         {
             self.quick_input.clear();
+            self.quick_cursor = 0;
             self.mode = Mode::Browse;
 
             if let Some(index) = self.session_for(&typed) {
@@ -1388,6 +1418,7 @@ impl App {
         }
 
         self.quick_input.clear();
+        self.quick_cursor = 0;
         self.mode = Mode::Browse;
     }
 
@@ -3031,6 +3062,96 @@ mod tests {
             before,
             "right no longer cycles the auth selector"
         );
+    }
+
+    /// The filter edits in place too — it was append-only for the same reason
+    /// the form was.
+    #[test]
+    fn the_filter_edits_in_the_middle() {
+        let mut app = fresh_app("filteredit", vec![host("web-01", &[])]);
+        press(&mut app, KeyCode::Char('/'));
+        for c in "web1".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Char('-'));
+        assert_eq!(app.filter, "web-1");
+
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.filter, "eb-1", "delete at the caret");
+
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.filter, "eb-", "end then backspace takes the last");
+    }
+
+    /// Entering the filter with something already in it puts the caret at the
+    /// end, not back at the start.
+    #[test]
+    fn reopening_the_filter_puts_the_caret_at_the_end() {
+        let mut app = fresh_app("filterreopen", vec![host("web-01", &[])]);
+        press(&mut app, KeyCode::Char('/'));
+        for c in "web".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter); // back to browse, filter kept
+
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('x'));
+
+        assert_eq!(app.filter, "webx", "typing landed somewhere else");
+    }
+
+    #[test]
+    fn quick_connect_edits_in_the_middle() {
+        let mut app = fresh_app("quickedit", vec![]);
+        press(&mut app, KeyCode::Char('c'));
+        for c in "deploy@10.0.0.".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        press(&mut app, KeyCode::Home);
+        for c in "root".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.quick_input, "rootdeploy@10.0.0.");
+
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.quick_input, "rooteploy@10.0.0.", "delete at the caret");
+    }
+
+    /// Clearing has to take the caret with it, or the next thing typed lands at
+    /// an offset into an empty string.
+    #[test]
+    fn leaving_an_input_resets_its_caret() {
+        let mut app = fresh_app("caretreset", vec![]);
+        press(&mut app, KeyCode::Char('c'));
+        for c in "abcdef".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.quick_input, "z");
+        assert_eq!(app.quick_cursor, 1);
+    }
+
+    /// Every path that empties an input has to take its caret with it. This one
+    /// returns early on a saved-host match and used to miss the reset.
+    #[test]
+    fn connecting_to_a_saved_name_resets_the_quick_caret() {
+        let mut app = fresh_app("quickcaretsaved", vec![host("web-01", &[])]);
+        press(&mut app, KeyCode::Char('c'));
+        for c in "web-01".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.quick_input.is_empty());
+        assert_eq!(app.quick_cursor, 0, "the caret outlived the value");
     }
 
     /// `↵` on a connected host must keep resuming. If it opened a second shell
