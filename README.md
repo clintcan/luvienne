@@ -201,8 +201,10 @@ See [`hosts.example.toml`](hosts.example.toml) for every field, commented.
 | `?` | help |
 | `q` | quit, closing every session |
 
-In the host form, `tab` moves between fields, `←`/`→` or space change a choice,
-and `^O` on the key path opens a file browser.
+In the host form, `tab` moves between fields and `^O` on the key path opens a
+file browser. Text fields edit in place — `←`/`→` move the caret, `home`/`end`
+jump to either end, and `delete` removes forwards. On the auth and remember
+selectors, `←`/`→` or space change the choice instead.
 
 `esc` cancels a connection that is in progress — which takes priority over
 clearing the filter, since a connect going nowhere is the more urgent thing to

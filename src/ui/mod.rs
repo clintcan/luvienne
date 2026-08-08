@@ -414,6 +414,26 @@ fn display_width(text: &str) -> usize {
 }
 
 /// The add/edit host form.
+/// The parts of `value` to draw either side of the caret, within `width`.
+///
+/// The caret takes a column of its own, and what follows it is capped at half
+/// the remainder so there is always room for the text *behind* the cursor —
+/// which is what you are looking at while typing. With the cursor at the end
+/// this reduces to keeping the tail visible, which is what it did before there
+/// was a cursor at all.
+fn split_at_caret(value: &str, cursor: usize, width: usize) -> (String, String) {
+    let byte = value
+        .char_indices()
+        .nth(cursor)
+        .map_or(value.len(), |(byte, _)| byte);
+    let (before, after) = value.split_at(byte);
+
+    let room = width.saturating_sub(1);
+    let after_shown = visible_head(after, room / 2);
+    let before_room = room.saturating_sub(display_width(&after_shown));
+    (visible_tail(before, before_room), after_shown)
+}
+
 fn render_form(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     use crate::app::form::FormMode;
 
@@ -438,30 +458,42 @@ fn render_form(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
         .saturating_sub(1);
 
     for (i, field) in fields.iter().enumerate() {
-        let focused = i == form.focus;
+        let focused = i == form.focus();
         let value = form.value(*field);
 
-        let shown = if value.is_empty() && !field.is_choice() {
+        let label = Span::styled(
+            format!("  {:>LABEL_TEXT$}  ", field.label()),
+            if focused {
+                theme.key_hint()
+            } else {
+                theme.dimmed()
+            },
+        );
+
+        let mut spans = vec![label];
+        if value.is_empty() && !field.is_choice() {
             // Clipped too: an over-long hint pushes the caret off the row, and
             // an empty focused field is where the caret matters most.
-            Span::styled(visible_head(field.hint(), value_width), theme.dimmed())
-        } else {
-            Span::styled(visible_tail(value, value_width), theme.base())
-        };
-
-        let mut spans = vec![
-            Span::styled(
-                format!("  {:>LABEL_TEXT$}  ", field.label()),
-                if focused {
-                    theme.key_hint()
-                } else {
-                    theme.dimmed()
-                },
-            ),
-            shown,
-        ];
-        if focused {
+            spans.push(Span::styled(
+                visible_head(field.hint(), value_width),
+                theme.dimmed(),
+            ));
+            if focused {
+                spans.push(Span::styled("▌", theme.key_hint()));
+            }
+        } else if focused && !field.is_choice() {
+            // Split at the caret so it draws where the cursor actually is. The
+            // window follows it, which is what makes editing the middle of a
+            // long path possible at all.
+            let (before, after) = split_at_caret(value, form.cursor(), value_width);
+            spans.push(Span::styled(before, theme.base()));
             spans.push(Span::styled("▌", theme.key_hint()));
+            spans.push(Span::styled(after, theme.base()));
+        } else {
+            spans.push(Span::styled(visible_tail(value, value_width), theme.base()));
+            if focused {
+                spans.push(Span::styled("▌", theme.key_hint()));
+            }
         }
         // A choice field always has a value, so the empty-field placeholder
         // above never fires for one and its hint would never be seen at all.
@@ -1455,11 +1487,7 @@ mod tests {
         let mut app = app_with(vec![]);
         let mut form = HostForm::add();
         form.auth_choice = 1; // key auth, so the path field exists
-        form.focus = form
-            .fields()
-            .iter()
-            .position(|f| *f == crate::app::form::Field::KeyPath)
-            .unwrap();
+        form.focus_on(crate::app::form::Field::KeyPath);
         form.key_path = "/already/typed/something".into();
         app.form = Some(form);
         app.mode = Mode::Form;
@@ -1493,11 +1521,7 @@ mod tests {
         let mut app = app_with(vec![]);
         let mut form = HostForm::add();
         form.auth_choice = 1; // key auth, so the field exists at all
-        form.focus = form
-            .fields()
-            .iter()
-            .position(|f| *f == Field::CachePassphrase)
-            .unwrap();
+        form.focus_on(Field::CachePassphrase);
         app.form = Some(form);
         app.mode = Mode::Form;
 
@@ -1811,6 +1835,34 @@ mod tests {
         }
     }
 
+    /// The caret has to be drawn where the cursor is, not parked at the end —
+    /// otherwise editing the middle of a field is invisible even though it works.
+    #[test]
+    fn the_caret_draws_where_the_cursor_sits() {
+        use crate::app::form::HostForm;
+
+        let mut app = app_with(vec![]);
+        let mut form = HostForm::add();
+        form.focus_on(crate::app::form::Field::Name);
+        for c in "web-01".chars() {
+            form.push(c);
+        }
+        form.cursor_left();
+        form.cursor_left();
+        app.form = Some(form);
+        app.mode = Mode::Form;
+
+        let out = draw(&app, 100, 24);
+        let row = out
+            .lines()
+            .find(|l| l.contains("web-01") || l.contains("web-"))
+            .unwrap_or("<no row>");
+        assert!(
+            row.contains("web-▌01"),
+            "the caret is not between the characters:\n{row}"
+        );
+    }
+
     /// Typing past the edge of a field used to be invisible: the characters
     /// landed in the buffer, the display stopped changing, and there was no way
     /// to tell a key path with a typo from one without. The **end** is what has
@@ -1823,11 +1875,7 @@ mod tests {
         let mut form = HostForm::add();
         form.auth_choice = 1;
         form.key_path = "/Users/someone/Documents/Clients/somewhere/deep/private-key.ppk".into();
-        form.focus = form
-            .fields()
-            .iter()
-            .position(|f| *f == Field::KeyPath)
-            .unwrap();
+        form.focus_on(Field::KeyPath);
         app.form = Some(form);
         app.mode = Mode::Form;
 
@@ -1857,11 +1905,7 @@ mod tests {
             let mut form = HostForm::add();
             form.auth_choice = 1;
             form.key_path = "/very/long/path/segment/".repeat(20);
-            form.focus = form
-                .fields()
-                .iter()
-                .position(|f| *f == Field::KeyPath)
-                .unwrap();
+            form.focus_on(Field::KeyPath);
             app.form = Some(form);
             app.mode = Mode::Form;
 
@@ -1925,11 +1969,7 @@ mod tests {
         use crate::app::form::{Field, HostForm};
         let mut app = app_with(vec![]);
         let mut form = HostForm::add();
-        form.focus = form
-            .fields()
-            .iter()
-            .position(|f| *f == Field::Jump)
-            .unwrap();
+        form.focus_on(Field::Jump);
         app.form = Some(form);
         app.mode = Mode::Form;
         let out = draw(&app, 44, 24);
@@ -1957,7 +1997,7 @@ mod tests {
         let mut app = app_with(vec![]);
         let mut form = HostForm::add();
         form.name = "\u{5BFD}".repeat(60);
-        form.focus = 0;
+        form.focus_on(crate::app::form::Field::Name);
         app.form = Some(form);
         app.mode = Mode::Form;
 

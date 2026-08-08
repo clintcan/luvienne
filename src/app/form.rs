@@ -86,6 +86,8 @@ pub enum FormMode {
 #[derive(Debug, Clone)]
 pub struct HostForm {
     pub mode: FormMode,
+    /// Caret position in the focused field, in characters. See [`Self::cursor`].
+    cursor: usize,
     pub name: String,
     pub address: String,
     pub port: String,
@@ -100,7 +102,10 @@ pub struct HostForm {
     pub jump: String,
     /// Port forwards in the terse `L 8080:db:5432` form, comma separated.
     pub forwards: String,
-    pub focus: usize,
+    /// Private: moving focus has to take the caret with it, so it goes through
+    /// [`Self::focus_on`] or the next/prev helpers. Setting it directly left the
+    /// cursor pointing into the field you just left.
+    focus: usize,
     /// Set when a save attempt failed validation.
     pub error: Option<String>,
     /// Fields the user has edited. Only meaningful for a bulk edit.
@@ -111,6 +116,8 @@ impl HostForm {
     pub fn add() -> Self {
         Self {
             mode: FormMode::Add,
+            // The first field starts empty, so the caret starts at its start.
+            cursor: 0,
             name: String::new(),
             address: String::new(),
             // Prefilled because it is almost always right, and an empty port
@@ -150,6 +157,9 @@ impl HostForm {
         };
         Self {
             mode: FormMode::Edit(index),
+            // End of the name, which is the focused field — editing usually
+            // means appending, and Home is one key away.
+            cursor: host.name.chars().count(),
             name: host.name.clone(),
             address: host.address.clone(),
             port: host.port.to_string(),
@@ -240,13 +250,81 @@ impl HostForm {
         }
     }
 
+    /// Which field has focus, as an index into [`Self::fields`].
+    pub fn focus(&self) -> usize {
+        self.focus
+    }
+
+    /// Move focus to a named field, taking the caret with it.
+    ///
+    /// Tests only: the app moves focus with tab and the arrow keys, which go
+    /// through `next_field`/`prev_field`.
+    #[cfg(test)]
+    pub fn focus_on(&mut self, field: Field) {
+        if let Some(index) = self.fields().iter().position(|f| *f == field) {
+            self.focus = index;
+            self.cursor_to_end();
+        }
+    }
+
     pub fn next_field(&mut self) {
         self.focus = (self.focus + 1) % self.fields().len();
+        self.cursor_to_end();
     }
 
     pub fn prev_field(&mut self) {
         let len = self.fields().len();
         self.focus = (self.focus + len - 1) % len;
+        self.cursor_to_end();
+    }
+
+    /// Where the caret sits in the focused field, counted in characters.
+    ///
+    /// One cursor rather than one per field: only the focused field can be
+    /// edited, and arriving at a field puts the caret at its end — which is
+    /// where you want it when tabbing through a form you are filling in.
+    pub fn cursor(&self) -> usize {
+        self.cursor.min(self.focused_len())
+    }
+
+    fn focused_len(&self) -> usize {
+        self.value(self.focused()).chars().count()
+    }
+
+    pub fn cursor_to_end(&mut self) {
+        self.cursor = self.focused_len();
+    }
+
+    pub fn cursor_left(&mut self) {
+        self.cursor = self.cursor().saturating_sub(1);
+    }
+
+    pub fn cursor_right(&mut self) {
+        self.cursor = (self.cursor() + 1).min(self.focused_len());
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Byte offset of a character index, for `String` operations.
+    fn byte_at(text: &str, chars: usize) -> usize {
+        text.char_indices()
+            .nth(chars)
+            .map_or(text.len(), |(byte, _)| byte)
+    }
+
+    /// Delete the character *at* the cursor, leaving the cursor where it is.
+    pub fn delete(&mut self) {
+        let field = self.focused();
+        let at = self.cursor();
+        self.touched.insert(field);
+        if let Some(buffer) = self.value_mut(field) {
+            let byte = Self::byte_at(buffer, at);
+            if byte < buffer.len() {
+                buffer.remove(byte);
+            }
+        }
     }
 
     /// Advance whichever choice field has focus. Text fields ignore this.
@@ -282,18 +360,27 @@ impl HostForm {
         if field == Field::Port && !c.is_ascii_digit() {
             return;
         }
+        let at = self.cursor();
         self.touched.insert(field);
         if let Some(buffer) = self.value_mut(field) {
-            buffer.push(c);
+            let byte = Self::byte_at(buffer, at);
+            buffer.insert(byte, c);
         }
+        self.cursor = at + 1;
     }
 
     pub fn backspace(&mut self) {
         let field = self.focused();
+        let at = self.cursor();
+        if at == 0 {
+            return;
+        }
         self.touched.insert(field);
         if let Some(buffer) = self.value_mut(field) {
-            buffer.pop();
+            let byte = Self::byte_at(buffer, at - 1);
+            buffer.remove(byte);
         }
+        self.cursor = at - 1;
     }
 
     /// Apply only the touched fields to an existing host.
@@ -516,11 +603,7 @@ mod tests {
     fn the_port_field_refuses_non_digits() {
         let mut form = filled();
         form.port.clear();
-        form.focus = form
-            .fields()
-            .iter()
-            .position(|f| *f == Field::Port)
-            .unwrap();
+        form.focus_on(Field::Port);
         for c in "2x2!".chars() {
             form.push(c);
         }
@@ -543,15 +626,11 @@ mod tests {
     fn cycling_auth_keeps_focus_in_range() {
         let mut form = filled();
         form.auth_choice = 1;
-        form.focus = form
-            .fields()
-            .iter()
-            .position(|f| *f == Field::KeyPath)
-            .unwrap();
+        form.focus_on(Field::KeyPath);
         assert_eq!(form.focused(), Field::KeyPath);
 
         form.cycle_auth(true);
-        assert!(form.focus < form.fields().len());
+        assert!(form.focus() < form.fields().len());
         assert_ne!(form.focused(), Field::KeyPath);
         assert!(
             !form.fields().contains(&Field::KeyPath),
@@ -642,11 +721,7 @@ mod tests {
         };
 
         let mut form = HostForm::bulk(vec![0]);
-        form.focus = form
-            .fields()
-            .iter()
-            .position(|f| *f == Field::Auth)
-            .unwrap();
+        form.focus_on(Field::Auth);
         form.cycle_auth(true); // key
         form.cycle_auth(true); // password
         form.apply_to(&mut host).unwrap();
@@ -678,18 +753,10 @@ mod tests {
 
         let mut form = HostForm::bulk(vec![0]);
         // Reach the field the way the user does: pick key auth, then walk to it.
-        form.focus = form
-            .fields()
-            .iter()
-            .position(|f| *f == Field::Auth)
-            .unwrap();
+        form.focus_on(Field::Auth);
         form.cycle_auth(true);
         form.key_path = "~/keys/a.ppk".into();
-        form.focus = form
-            .fields()
-            .iter()
-            .position(|f| *f == Field::CachePassphrase)
-            .unwrap();
+        form.focus_on(Field::CachePassphrase);
         form.cycle_choice(true); // no -> yes
         form.cycle_choice(true); // yes -> no
         form.apply_to(&mut host).unwrap();
@@ -757,11 +824,7 @@ mod tests {
         };
 
         let mut form = HostForm::bulk(vec![0]);
-        form.focus = form
-            .fields()
-            .iter()
-            .position(|f| *f == Field::CachePassphrase)
-            .unwrap();
+        form.focus_on(Field::CachePassphrase);
         form.cycle_choice(true);
         form.apply_to(&mut host).unwrap();
 
@@ -780,7 +843,7 @@ mod tests {
         let widest = form.fields().len();
 
         form.cycle_auth(true);
-        assert!(form.focus < form.fields().len());
+        assert!(form.focus() < form.fields().len());
         assert!(
             form.fields().len() < widest,
             "cycling away from key auth should drop at least one field"

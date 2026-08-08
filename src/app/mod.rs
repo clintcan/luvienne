@@ -795,6 +795,32 @@ impl App {
                             form.prev_field();
                         }
                     }
+                    // Text fields move the caret; only a selector cycles.
+                    KeyCode::Left if !is_choice => {
+                        if let Some(form) = self.form.as_mut() {
+                            form.cursor_left();
+                        }
+                    }
+                    KeyCode::Right if !is_choice => {
+                        if let Some(form) = self.form.as_mut() {
+                            form.cursor_right();
+                        }
+                    }
+                    KeyCode::Home => {
+                        if let Some(form) = self.form.as_mut() {
+                            form.cursor_home();
+                        }
+                    }
+                    KeyCode::End => {
+                        if let Some(form) = self.form.as_mut() {
+                            form.cursor_to_end();
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if let Some(form) = self.form.as_mut() {
+                            form.delete();
+                        }
+                    }
                     KeyCode::Left | KeyCode::Right if is_choice => {
                         if let Some(form) = self.form.as_mut() {
                             form.cycle_choice(key.code == KeyCode::Right);
@@ -841,6 +867,9 @@ impl App {
                             // for it, then return to the form.
                             if let Some(form) = self.form.as_mut() {
                                 form.key_path = chosen.display().to_string();
+                                // The value was replaced wholesale, so the caret
+                                // has to follow it rather than sit mid-path.
+                                form.cursor_to_end();
                                 form.error = None;
                             }
                             self.picker = None;
@@ -1910,13 +1939,13 @@ mod tests {
         assert_eq!(app.mode, Mode::Form);
 
         for (field, text) in [
-            (0, "web-01"),
-            (1, "10.0.0.1"),
-            (3, "deploy"),
-            (4, "prod, web"),
+            (Field::Name, "web-01"),
+            (Field::Address, "10.0.0.1"),
+            (Field::User, "deploy"),
+            (Field::Tags, "prod, web"),
         ] {
             if let Some(form) = app.form.as_mut() {
-                form.focus = field;
+                form.focus_on(field);
             }
             for c in text.chars() {
                 press(&mut app, KeyCode::Char(c));
@@ -2127,11 +2156,7 @@ mod tests {
         // Switch to key auth so the path field exists, then focus it.
         if let Some(form) = app.form.as_mut() {
             form.auth_choice = 1;
-            form.focus = form
-                .fields()
-                .iter()
-                .position(|f| *f == Field::KeyPath)
-                .unwrap();
+            form.focus_on(Field::KeyPath);
             form.key_path = dir.display().to_string();
         }
         assert_eq!(app.form.as_ref().unwrap().focused(), Field::KeyPath);
@@ -2165,11 +2190,7 @@ mod tests {
         press(&mut app, KeyCode::Char('a'));
         if let Some(form) = app.form.as_mut() {
             form.auth_choice = 1;
-            form.focus = form
-                .fields()
-                .iter()
-                .position(|f| *f == Field::KeyPath)
-                .unwrap();
+            form.focus_on(Field::KeyPath);
             form.key_path = "/original/path".into();
         }
 
@@ -2922,6 +2943,96 @@ mod tests {
         assert_eq!(app.mode, Mode::Browse);
     }
 
+    /// The whole point: fixing a typo in the middle without rubbing out
+    /// everything after it. Before this the form was append-only.
+    #[test]
+    fn the_form_edits_in_the_middle_of_a_field() {
+        let mut app = fresh_app("formedit", vec![]);
+        press(&mut app, KeyCode::Char('a'));
+        for c in "web-1".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        // Back over the "1" and insert a "0" before it.
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Char('0'));
+
+        assert_eq!(app.form.as_ref().unwrap().name, "web-01");
+    }
+
+    #[test]
+    fn home_end_and_delete_work_in_a_field() {
+        let mut app = fresh_app("formnav", vec![]);
+        press(&mut app, KeyCode::Char('a'));
+        for c in "web-01".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(
+            app.form.as_ref().unwrap().name,
+            "eb-01",
+            "delete at the caret"
+        );
+
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            app.form.as_ref().unwrap().name,
+            "eb-01x",
+            "end went to the end"
+        );
+
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(
+            app.form.as_ref().unwrap().name,
+            "eb-01x",
+            "backspace at the start should do nothing"
+        );
+    }
+
+    /// Moving between fields has to take the caret with it, or typing in the
+    /// next field inserts at an offset from the previous one.
+    #[test]
+    fn the_caret_follows_focus_between_fields() {
+        let mut app = fresh_app("formfocus", vec![]);
+        press(&mut app, KeyCode::Char('a'));
+        for c in "web-01".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Home); // caret at 0 in `name`
+
+        press(&mut app, KeyCode::Tab); // address, which is empty
+        for c in "10.0.0.1".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+
+        let form = app.form.as_ref().unwrap();
+        assert_eq!(form.address, "10.0.0.1", "typed out of order");
+        assert_eq!(form.name, "web-01", "the other field was disturbed");
+    }
+
+    /// Arrows still cycle a selector — they are the only way to change one.
+    #[test]
+    fn arrows_still_cycle_a_choice_field() {
+        let mut app = fresh_app("formchoice", vec![]);
+        press(&mut app, KeyCode::Char('a'));
+        if let Some(form) = app.form.as_mut() {
+            form.focus_on(Field::Auth);
+        }
+        let before = app.form.as_ref().unwrap().auth_choice;
+
+        press(&mut app, KeyCode::Right);
+
+        assert_ne!(
+            app.form.as_ref().unwrap().auth_choice,
+            before,
+            "right no longer cycles the auth selector"
+        );
+    }
+
     /// `↵` on a connected host must keep resuming. If it opened a second shell
     /// instead, every stray Enter would leave one behind on the remote.
     #[test]
@@ -3110,11 +3221,7 @@ mod tests {
 
         // Focus the user field and type into it.
         if let Some(form) = app.form.as_mut() {
-            form.focus = form
-                .fields()
-                .iter()
-                .position(|f| *f == Field::User)
-                .unwrap();
+            form.focus_on(Field::User);
         }
         for c in "deploy".chars() {
             press(&mut app, KeyCode::Char(c));
@@ -3138,11 +3245,7 @@ mod tests {
 
         press(&mut app, KeyCode::Char('b'));
         if let Some(form) = app.form.as_mut() {
-            form.focus = form
-                .fields()
-                .iter()
-                .position(|f| *f == Field::User)
-                .unwrap();
+            form.focus_on(Field::User);
         }
         for c in "only".chars() {
             press(&mut app, KeyCode::Char(c));
@@ -3166,13 +3269,11 @@ mod tests {
 
         press(&mut app, KeyCode::Char('b'));
         if let Some(form) = app.form.as_mut() {
-            form.focus = form
-                .fields()
-                .iter()
-                .position(|f| *f == Field::User)
-                .unwrap();
-            form.user = "x".into();
+            form.focus_on(Field::User);
         }
+        // Typed and then rubbed out, which is how a field gets *deliberately*
+        // emptied — assigning the value directly would leave the caret behind it.
+        press(&mut app, KeyCode::Char('x'));
         press(&mut app, KeyCode::Backspace);
         press(&mut app, KeyCode::Enter);
 
