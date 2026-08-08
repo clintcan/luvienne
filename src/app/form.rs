@@ -314,10 +314,14 @@ impl HostForm {
     pub fn delete(&mut self) {
         let field = self.focused();
         let at = self.cursor();
+        // Only a field with a buffer can be edited. Marking a *selector* touched
+        // here would let a stray keystroke apply its value to every host in a
+        // bulk edit, which is what `touched` decides.
+        let Some(buffer) = self.value_mut(field) else {
+            return;
+        };
+        input::delete(buffer, at);
         self.touched.insert(field);
-        if let Some(buffer) = self.value_mut(field) {
-            input::delete(buffer, at);
-        }
     }
 
     /// Advance whichever choice field has focus. Text fields ignore this.
@@ -354,10 +358,11 @@ impl HostForm {
             return;
         }
         let mut at = self.cursor();
+        let Some(buffer) = self.value_mut(field) else {
+            return;
+        };
+        input::insert(buffer, &mut at, c);
         self.touched.insert(field);
-        if let Some(buffer) = self.value_mut(field) {
-            input::insert(buffer, &mut at, c);
-        }
         self.cursor = at;
     }
 
@@ -367,10 +372,11 @@ impl HostForm {
         if at == 0 {
             return;
         }
+        let Some(buffer) = self.value_mut(field) else {
+            return;
+        };
+        input::backspace(buffer, &mut at);
         self.touched.insert(field);
-        if let Some(buffer) = self.value_mut(field) {
-            input::backspace(buffer, &mut at);
-        }
         self.cursor = at;
     }
 

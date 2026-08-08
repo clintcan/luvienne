@@ -3154,6 +3154,32 @@ mod tests {
         assert_eq!(app.quick_cursor, 0, "the caret outlived the value");
     }
 
+    /// Bulk edit applies exactly the fields you touched. Typing at a *selector*
+    /// changes nothing on screen, so it must not silently count as touching it —
+    /// otherwise a stray keystroke rewrites the auth method of every host shown.
+    #[test]
+    fn typing_at_a_selector_does_not_count_as_changing_it() {
+        let mut a = host("alpha", &[]);
+        a.auth = AuthRef::Password;
+        let mut app = fresh_app("bulkselector", vec![a]);
+
+        press(&mut app, KeyCode::Char('b'));
+        if let Some(form) = app.form.as_mut() {
+            form.focus_on(Field::Auth);
+        }
+        // None of these can change a selector; only ←/→ and space can.
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Enter);
+
+        assert!(
+            matches!(app.inventory.hosts[0].auth, AuthRef::Password),
+            "a stray keystroke rewrote the auth method, got {:?}",
+            app.inventory.hosts[0].auth
+        );
+    }
+
     /// `↵` on a connected host must keep resuming. If it opened a second shell
     /// instead, every stray Enter would leave one behind on the remote.
     #[test]
